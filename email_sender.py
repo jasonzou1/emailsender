@@ -8,7 +8,10 @@ import time
 import threading
 import sys
 
-REQUIRED_COLUMNS = ("FirstName", "Email")
+# Accepted header spellings (matched case-insensitively, ignoring spaces/underscores/hyphens)
+EMAIL_HEADERS = ("email", "emailaddress", "e-mail")
+FIRST_NAME_HEADERS = ("firstname", "first")
+FULL_NAME_HEADERS = ("name", "fullname", "customername", "clientname", "contactname")
 
 
 # --- Helper function for script path ---
@@ -23,6 +26,27 @@ def clean_cell(value):
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def normalize_header(header):
+    return str(header).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def find_column(columns, accepted):
+    """Returns the first column whose normalized header is in accepted, or None"""
+    accepted = {normalize_header(a) for a in accepted}
+    for col in columns:
+        if normalize_header(col) in accepted:
+            return col
+    return None
+
+
+def first_name_from_full(full_name):
+    """'Anna Smith' -> 'Anna', 'Smith, Anna' -> 'Anna'"""
+    if "," in full_name:
+        full_name = full_name.split(",", 1)[1]
+    parts = full_name.split()
+    return parts[0] if parts else ""
 
 
 def fill_placeholders(text, name):
@@ -163,10 +187,18 @@ class EmailSenderApp:
             df = pd.read_excel(excel_file)
             df.columns = [str(c).strip() for c in df.columns]
 
-            missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-            if missing:
-                self.log(f"Error: Excel is missing column(s): {', '.join(missing)}. Found: {', '.join(df.columns)}") # 日志
+            email_col = find_column(df.columns, EMAIL_HEADERS)
+            first_col = find_column(df.columns, FIRST_NAME_HEADERS)
+            full_col = find_column(df.columns, FULL_NAME_HEADERS)
+
+            if email_col is None or (first_col is None and full_col is None):
+                self.log("Error: Excel needs an 'Email' column and a 'FirstName' (or full 'Name') column. "
+                         f"Found: {', '.join(df.columns)}") # 日志
                 return
+            if first_col is not None:
+                self.log(f"Using columns: '{first_col}' (first name), '{email_col}' (email)") # 日志
+            else:
+                self.log(f"Using columns: '{full_col}' (full name, first word used), '{email_col}' (email)") # 日志
 
             # --- Load HTML content early (if using HTML template) ---
             html_content = None
@@ -191,8 +223,10 @@ class EmailSenderApp:
                     self.log("Task interrupted.") # 日志
                     break
 
-                email = clean_cell(row['Email'])
-                name = clean_cell(row['FirstName'])
+                email = clean_cell(row[email_col])
+                name = clean_cell(row[first_col]) if first_col is not None else ""
+                if not name and full_col is not None:
+                    name = first_name_from_full(clean_cell(row[full_col]))
 
                 if not email or '@' not in email:
                     self.log(f"[{pos}/{total}] Skipped: invalid or empty email '{email}'") # 日志
