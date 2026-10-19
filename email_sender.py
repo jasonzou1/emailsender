@@ -1,0 +1,251 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+import pandas as pd
+import pythoncom
+import win32com.client as win32
+import os
+import time
+import threading
+import sys
+
+REQUIRED_COLUMNS = ("FirstName", "Email")
+
+
+# --- Helper function for script path ---
+def get_script_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def clean_cell(value):
+    """Returns a stripped string, or '' for empty/NaN cells"""
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def fill_placeholders(text, name):
+    """Replaces {name}/{FirstName} without str.format, so other braces (e.g. CSS) are safe"""
+    return text.replace('{name}', name).replace('{FirstName}', name)
+
+
+class EmailSenderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("My Baskets Email Sender (HTML/OFT Supported)") # 软件标题
+        self.root.geometry("600x550")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Stored variables
+        self.excel_path = tk.StringVar()
+        self.template_path = tk.StringVar()
+        self.subject_template = tk.StringVar(value="Hello {name} From My Baskets")
+        self.is_running = False
+
+        # --- UI Layout ---
+
+        # 1. Select Excel File
+        frame_excel = tk.LabelFrame(root, text="1. Select Customer List (Excel)", padx=10, pady=10) # 标签
+        frame_excel.pack(fill="x", padx=10, pady=5)
+
+        tk.Entry(frame_excel, textvariable=self.excel_path, width=50).pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_excel, text="Browse...", command=self.select_excel).pack(side=tk.LEFT) # 按钮
+
+        # 2. Select Outlook Template
+        frame_tmpl = tk.LabelFrame(root, text="2. Select Email Template (.oft or .html)", padx=10, pady=10) # 标签
+        frame_tmpl.pack(fill="x", padx=10, pady=5)
+
+        tk.Entry(frame_tmpl, textvariable=self.template_path, width=50).pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_tmpl, text="Browse...", command=self.select_template).pack(side=tk.LEFT) # 按钮
+
+        # 3. Set Subject Line
+        frame_subj = tk.LabelFrame(root, text="3. Set Email Subject ({name} will be replaced)", padx=10, pady=10) # 标签
+        frame_subj.pack(fill="x", padx=10, pady=5)
+        tk.Entry(frame_subj, textvariable=self.subject_template, width=60).pack(padx=5)
+
+        # 4. Action Button (Start / Stop)
+        frame_btn = tk.Frame(root, pady=10)
+        frame_btn.pack()
+        self.btn_start = tk.Button(frame_btn, text="Start Sending", command=self.toggle_sending, bg="#4CAF50", fg="white", font=("Arial", 12, "bold"), width=15) # 按钮
+        self.btn_start.pack()
+
+        # 5. Execution Log
+        tk.Label(root, text="Execution Log:").pack(anchor="w", padx=10) # 标签
+        self.log_area = scrolledtext.ScrolledText(root, height=15)
+        self.log_area.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.auto_load_files()
+
+    # --- Thread-safe UI helpers (Tkinter must only be touched from the main thread) ---
+
+    def ui(self, func, *args):
+        self.root.after(0, func, *args)
+
+    def log(self, message):
+        """Adds message to the log area (safe to call from any thread)"""
+        if threading.current_thread() is threading.main_thread():
+            self._append_log(message)
+        else:
+            self.ui(self._append_log, message)
+
+    def _append_log(self, message):
+        self.log_area.insert(tk.END, message + "\n")
+        self.log_area.see(tk.END)
+
+    def auto_load_files(self):
+        """Auto-detects files in the current directory"""
+        cwd = get_script_dir()
+        default_excel = os.path.join(cwd, "clients.xlsx")
+        default_tmpl_oft = os.path.join(cwd, "template.oft")
+        default_tmpl_html = os.path.join(cwd, "template.html")
+
+        if os.path.exists(default_excel):
+            self.excel_path.set(default_excel)
+            self.log(f"Auto-loaded Excel: {default_excel}") # 日志
+
+        if os.path.exists(default_tmpl_oft):
+            self.template_path.set(default_tmpl_oft)
+            self.log(f"Auto-loaded OFT Template: {default_tmpl_oft}") # 日志
+        elif os.path.exists(default_tmpl_html):
+            self.template_path.set(default_tmpl_html)
+            self.log(f"Auto-loaded HTML Template: {default_tmpl_html}") # 日志
+
+    def select_excel(self):
+        filename = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
+        if filename:
+            self.excel_path.set(filename)
+
+    def select_template(self):
+        filename = filedialog.askopenfilename(filetypes=[("Email Templates", "*.oft *.html *.htm")])
+        if filename:
+            self.template_path.set(filename)
+
+    def toggle_sending(self):
+        if self.is_running:
+            self.is_running = False
+            self.btn_start.config(state="disabled", text="Stopping...") # 按钮文本
+        else:
+            self.start_thread()
+
+    def start_thread(self):
+        """Starts the sending process in a separate thread"""
+        excel_file = self.excel_path.get().strip()
+        template_file = self.template_path.get().strip()
+
+        if not excel_file or not template_file:
+            messagebox.showwarning("Warning", "Please select both Excel and Template files!") # 提示框
+            return
+        for path in (excel_file, template_file):
+            if not os.path.isfile(path):
+                messagebox.showwarning("Warning", f"File not found:\n{path}") # 提示框
+                return
+
+        # Read Tk variables here, in the main thread
+        subject_tmpl = self.subject_template.get()
+
+        self.is_running = True
+        self.btn_start.config(text="Stop", bg="#f44336") # 按钮文本
+        thread = threading.Thread(target=self.run_sending_process,
+                                  args=(excel_file, template_file, subject_tmpl))
+        thread.daemon = True
+        thread.start()
+
+    def run_sending_process(self, excel_file, template_file, subject_tmpl):
+        # COM must be initialized on every thread that uses it
+        pythoncom.CoInitialize()
+        success_count = 0
+        skipped_count = 0
+        failed_count = 0
+        try:
+            self.log("-" * 30)
+            self.log("Reading Excel file...") # 日志
+            df = pd.read_excel(excel_file)
+            df.columns = [str(c).strip() for c in df.columns]
+
+            missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+            if missing:
+                self.log(f"Error: Excel is missing column(s): {', '.join(missing)}. Found: {', '.join(df.columns)}") # 日志
+                return
+
+            # --- Load HTML content early (if using HTML template) ---
+            html_content = None
+            if template_file.lower().endswith(('.html', '.htm')):
+                self.log("HTML template detected. Loading content...") # 日志
+                try:
+                    with open(template_file, 'r', encoding='utf-8-sig') as f:
+                        html_content = f.read()
+                except Exception as e:
+                    self.log(f"Error: Could not read HTML template file. {e}") # 日志
+                    return
+
+            try:
+                outlook = win32.Dispatch('outlook.application')
+            except Exception as e:
+                self.log(f"Error: Could not connect to Outlook. Ensure Classic Outlook is open. ({e})") # 日志
+                return
+
+            total = len(df)
+            for pos, (_, row) in enumerate(df.iterrows(), start=1):
+                if not self.is_running:
+                    self.log("Task interrupted.") # 日志
+                    break
+
+                email = clean_cell(row['Email'])
+                name = clean_cell(row['FirstName'])
+
+                if not email or '@' not in email:
+                    self.log(f"[{pos}/{total}] Skipped: invalid or empty email '{email}'") # 日志
+                    skipped_count += 1
+                    continue
+
+                try:
+                    # Create Mail Item
+                    if html_content is not None:
+                        mail = outlook.CreateItem(0)
+                        mail.HTMLBody = fill_placeholders(html_content, name)
+                    else:
+                        mail = outlook.CreateItemFromTemplate(template_file)
+                        if mail.HTMLBody:
+                            mail.HTMLBody = fill_placeholders(mail.HTMLBody, name)
+
+                    mail.To = email
+                    mail.Subject = fill_placeholders(subject_tmpl, name)
+                    mail.Send()
+
+                    self.log(f"[{pos}/{total}] Successfully sent to: {name} ({email})") # 日志
+                    success_count += 1
+
+                    time.sleep(1)
+
+                except Exception as e:
+                    self.log(f"[{pos}/{total}] Failed to send ({email}): {e}") # 日志
+                    failed_count += 1
+
+            summary = f"Sent: {success_count}, Failed: {failed_count}, Skipped: {skipped_count}"
+            self.log(f"Task finished. {summary}") # 日志
+            self.ui(messagebox.showinfo, "Complete", f"Task finished!\n{summary}") # 提示框
+
+        except Exception as e:
+            self.log(f"Critical Error: {e}") # 日志
+            self.ui(messagebox.showerror, "Error", str(e)) # 提示框
+
+        finally:
+            pythoncom.CoUninitialize()
+            self.ui(self.reset_ui)
+
+    def reset_ui(self):
+        self.is_running = False
+        self.btn_start.config(state="normal", text="Start Sending", bg="#4CAF50") # 按钮文本
+
+    def on_close(self):
+        if self.is_running and not messagebox.askyesno("Quit", "Emails are still being sent. Stop and quit?"):
+            return
+        self.is_running = False
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = EmailSenderApp(root)
+    root.mainloop()
