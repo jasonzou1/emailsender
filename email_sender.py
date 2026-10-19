@@ -1,4 +1,6 @@
 import tkinter as tk
+import html
+import re
 from tkinter import filedialog, messagebox, scrolledtext
 import pandas as pd
 import pythoncom
@@ -12,6 +14,9 @@ import sys
 EMAIL_HEADERS = ("email", "emailaddress", "e-mail")
 FIRST_NAME_HEADERS = ("firstname", "first")
 FULL_NAME_HEADERS = ("name", "fullname", "customername", "clientname", "contactname")
+
+# Matches {{Column}} (any Excel column) or {Column} (single braces, letters/digits only so CSS is left alone)
+PLACEHOLDER_RE = re.compile(r'\{\{\s*([^{}<>]+?)\s*\}\}|\{([A-Za-z][A-Za-z0-9 _-]*)\}')
 
 
 # --- Helper function for script path ---
@@ -49,9 +54,31 @@ def first_name_from_full(full_name):
     return parts[0] if parts else ""
 
 
-def fill_placeholders(text, name):
-    """Replaces {name}/{FirstName} without str.format, so other braces (e.g. CSS) are safe"""
-    return text.replace('{name}', name).replace('{FirstName}', name)
+def build_values(row, columns, first_name):
+    """Maps normalized column header -> cell text; {name}/{FirstName} always use the derived first name"""
+    values = {normalize_header(col): clean_cell(row[col]) for col in columns}
+    values["name"] = first_name
+    values["firstname"] = first_name
+    return values
+
+
+def fill_placeholders(text, values, escape_html=False):
+    """Replaces {{Column}} / {Column} with the row's values; unknown placeholders are left as-is"""
+    def sub(match):
+        key = normalize_header(match.group(1) or match.group(2))
+        if key not in values:
+            return match.group(0)
+        return html.escape(values[key]) if escape_html else values[key]
+    return PLACEHOLDER_RE.sub(sub, text)
+
+
+def unknown_placeholders(text, known_keys):
+    """Returns {{...}} placeholders in text that don't match any column"""
+    found = []
+    for match in PLACEHOLDER_RE.finditer(text):
+        if match.group(1) and normalize_header(match.group(1)) not in known_keys and match.group(0) not in found:
+            found.append(match.group(0))
+    return found
 
 
 class EmailSenderApp:
@@ -84,7 +111,7 @@ class EmailSenderApp:
         tk.Button(frame_tmpl, text="Browse...", command=self.select_template).pack(side=tk.LEFT) # 按钮
 
         # 3. Set Subject Line
-        frame_subj = tk.LabelFrame(root, text="3. Set Email Subject ({name} will be replaced)", padx=10, pady=10) # 标签
+        frame_subj = tk.LabelFrame(root, text="3. Set Email Subject ({{FirstName}}, {{Company}}, any column)", padx=10, pady=10) # 标签
         frame_subj.pack(fill="x", padx=10, pady=5)
         tk.Entry(frame_subj, textvariable=self.subject_template, width=60).pack(padx=5)
 
@@ -217,6 +244,14 @@ class EmailSenderApp:
                 self.log(f"Error: Could not connect to Outlook. Ensure Classic Outlook is open. ({e})") # 日志
                 return
 
+            # --- Make sure every {{placeholder}} matches an Excel column before sending anything ---
+            body_text = html_content if html_content is not None else (outlook.CreateItemFromTemplate(template_file).HTMLBody or "")
+            known_keys = {normalize_header(c) for c in df.columns} | {"name", "firstname"}
+            unknown = unknown_placeholders(subject_tmpl + body_text, known_keys)
+            if unknown:
+                self.log(f"Error: No Excel column for placeholder(s): {', '.join(unknown)}. Found columns: {', '.join(df.columns)}") # 日志
+                return
+
             total = len(df)
             for pos, (_, row) in enumerate(df.iterrows(), start=1):
                 if not self.is_running:
@@ -227,6 +262,7 @@ class EmailSenderApp:
                 name = clean_cell(row[first_col]) if first_col is not None else ""
                 if not name and full_col is not None:
                     name = first_name_from_full(clean_cell(row[full_col]))
+                values = build_values(row, df.columns, name)
 
                 if not email or '@' not in email:
                     self.log(f"[{pos}/{total}] Skipped: invalid or empty email '{email}'") # 日志
@@ -237,14 +273,14 @@ class EmailSenderApp:
                     # Create Mail Item
                     if html_content is not None:
                         mail = outlook.CreateItem(0)
-                        mail.HTMLBody = fill_placeholders(html_content, name)
+                        mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
                     else:
                         mail = outlook.CreateItemFromTemplate(template_file)
                         if mail.HTMLBody:
-                            mail.HTMLBody = fill_placeholders(mail.HTMLBody, name)
+                            mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
 
                     mail.To = email
-                    mail.Subject = fill_placeholders(subject_tmpl, name)
+                    mail.Subject = fill_placeholders(subject_tmpl, values)
                     mail.Send()
 
                     self.log(f"[{pos}/{total}] Successfully sent to: {name} ({email})") # 日志
