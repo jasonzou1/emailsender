@@ -9,6 +9,9 @@ import os
 import time
 import threading
 import sys
+import ctypes
+
+CO_E_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005
 
 # Accepted header spellings (matched case-insensitively, ignoring spaces/underscores/hyphens)
 EMAIL_HEADERS = ("email", "emailaddress", "e-mail")
@@ -17,6 +20,21 @@ FULL_NAME_HEADERS = ("name", "fullname", "customername", "clientname", "contactn
 
 # Matches {{Column}} (any Excel column) or {Column} (single braces, letters/digits only so CSS is left alone)
 PLACEHOLDER_RE = re.compile(r'\{\{\s*([^{}<>]+?)\s*\}\}|\{([A-Za-z][A-Za-z0-9 _-]*)\}')
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def connect_outlook():
+    """Attaches to the running Outlook first; only starts a new instance if none is found"""
+    try:
+        return win32.GetActiveObject('Outlook.Application')
+    except Exception:
+        return win32.Dispatch('Outlook.Application')
 
 
 # --- Helper function for script path ---
@@ -127,6 +145,9 @@ class EmailSenderApp:
         self.log_area.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.auto_load_files()
+        if is_admin():
+            self.log("Warning: running as Administrator. If Outlook is not also running as Administrator, "
+                     "the connection will fail - start this program normally instead.") # 日志
 
     # --- Thread-safe UI helpers (Tkinter must only be touched from the main thread) ---
 
@@ -239,9 +260,16 @@ class EmailSenderApp:
                     return
 
             try:
-                outlook = win32.Dispatch('outlook.application')
+                outlook = connect_outlook()
             except Exception as e:
                 self.log(f"Error: Could not connect to Outlook. Ensure Classic Outlook is open. ({e})") # 日志
+                if getattr(e, 'hresult', None) == CO_E_SERVER_EXEC_FAILURE or (e.args and e.args[0] == CO_E_SERVER_EXEC_FAILURE):
+                    if is_admin():
+                        self.log("Cause: this program is running as Administrator but Outlook is not. "
+                                 "Close it and start it normally (not 'Run as administrator').") # 日志
+                    else:
+                        self.log("Cause: Outlook seems to be running as Administrator, or is still starting/busy. "
+                                 "Close Outlook completely (check Task Manager), reopen it normally, wait until it has loaded, then try again.") # 日志
                 return
 
             # --- Make sure every {{placeholder}} matches an Excel column before sending anything ---

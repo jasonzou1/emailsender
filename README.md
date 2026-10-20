@@ -34,3 +34,13 @@ Use `{{ColumnName}}` for **any** column in your Excel, e.g. `{{FirstName}}`, `{{
 4. Click **Start Sending** (click again to **Stop**).
 
 If `clients.xlsx`, `template.oft` or `template.html` sit next to the script/exe, they are loaded automatically.
+
+## Troubleshooting
+
+**"Could not connect to Outlook ... Server execution failed" (-2146959355)**
+
+The sender and Outlook are running with different permission levels. Windows blocks them from talking to each other.
+
+1. Close the email sender and close Outlook completely (check Task Manager for leftover `OUTLOOK.EXE`).
+2. Open Outlook normally (not "Run as administrator") and wait until it has finished loading.
+3. Start the email sender normally too: don't use "Run as administrator", don't launch it from an admin Command Prompt or an IDE running as admin, and make sure the `.exe`'s Properties → Compatibility → "Run this program as an administrator" is unchecked.
