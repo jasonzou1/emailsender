@@ -31,7 +31,19 @@ Use `{{ColumnName}}` for **any** column in your Excel, e.g. `{{FirstName}}`, `{{
 - If the template or subject contains a `{{placeholder}}` with no matching column, **nothing is sent** and the log lists the unknown placeholder(s), so typos never reach customers.
 - In `.oft` templates, type each placeholder in one go: if Outlook formats part of it differently (e.g. bold only `First`), the placeholder gets split and won't be replaced.
 
-4. Click **Start Sending** (click again to **Stop**).
+4. **Batch settings** – how many emails per batch (default 20) and seconds to wait between emails (default 5).
+5. Click **Send Next 20**. It sends one batch and stops. Click it again whenever you're ready for the next batch. **Stop** halts mid-batch.
+
+### Remembering where you are
+
+- Every address is saved to `email_sender_progress.json` (next to the program) **right after it is sent**, so closing the app, a crash or a restart never loses your place and never re-sends to someone.
+- Progress is kept per **Excel list + template** pair: a new template starts the same list from the top.
+- The app reopens the last Excel/template, subject and batch settings automatically.
+- Progress is tracked by email address, not row number, so you can add, remove or re-sort rows in the Excel safely. Duplicate addresses are only emailed once.
+- Failed addresses are not retried automatically (shown as "Failed" in the progress line, with the reason in the log).
+- **Reset Progress** forgets what was sent for the current list + template, so the next batch starts from the top again.
+- Keep `email_sender_progress.json` private: it contains customer email addresses.
+
 
 If `clients.xlsx`, `template.oft` or `template.html` sit next to the script/exe, they are loaded automatically.
 

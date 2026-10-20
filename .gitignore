@@ -4,3 +4,4 @@ build/
 dist/
 *.spec
 clients.xlsx
+email_sender_progress.json*
