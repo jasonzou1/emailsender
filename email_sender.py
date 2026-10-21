@@ -1,7 +1,7 @@
 import tkinter as tk
 import html
 import re
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import pandas as pd
 import pythoncom
 import win32com.client as win32
@@ -14,6 +14,7 @@ import json
 from datetime import datetime
 
 CO_E_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005
+DISPID_SEND_USING_ACCOUNT = 64209
 
 # Accepted header spellings (matched case-insensitively, ignoring spaces/underscores/hyphens)
 EMAIL_HEADERS = ("email", "emailaddress", "e-mail")
@@ -23,6 +24,17 @@ FULL_NAME_HEADERS = ("name", "fullname", "customername", "clientname", "contactn
 STATE_FILENAME = "email_sender_progress.json"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_DELAY_SECONDS = 5
+
+# Customer status labels shown in the table
+ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE = (
+    "Sent", "Failed", "Next batch", "Pending", "Invalid email", "Duplicate")
+STATUS_FILTERS = {
+    "All": None,
+    "Not sent yet": {ST_NEXT, ST_PENDING},
+    "Sent": {ST_SENT},
+    "Failed": {ST_FAILED},
+    "Skipped": {ST_INVALID, ST_DUPLICATE},
+}
 
 # Matches {{Column}} (any Excel column) or {Column} (single braces, letters/digits only so CSS is left alone)
 PLACEHOLDER_RE = re.compile(r'\{\{\s*([^{}<>]+?)\s*\}\}|\{([A-Za-z][A-Za-z0-9 _-]*)\}')
@@ -41,6 +53,51 @@ def connect_outlook():
         return win32.GetActiveObject('Outlook.Application')
     except Exception:
         return win32.Dispatch('Outlook.Application')
+
+
+def explain_outlook_error(e):
+    """Extra hint for the common 'Server execution failed' error"""
+    if getattr(e, 'hresult', None) == CO_E_SERVER_EXEC_FAILURE or (e.args and e.args[0] == CO_E_SERVER_EXEC_FAILURE):
+        if is_admin():
+            return ("Cause: this program is running as Administrator but Outlook is not. "
+                    "Close it and start it normally (not 'Run as administrator').")
+        return ("Cause: Outlook seems to be running as Administrator, or is still starting/busy. "
+                "Close Outlook completely (check Task Manager), reopen it normally, wait until it has loaded, then try again.")
+    return None
+
+
+def account_address(account):
+    try:
+        return account.SmtpAddress or account.DisplayName
+    except Exception:
+        return account.DisplayName
+
+
+def get_accounts(outlook):
+    """Returns (list of Outlook account objects, the default sending account)"""
+    session = outlook.Session
+    accounts = [session.Accounts.Item(i) for i in range(1, session.Accounts.Count + 1)]
+    default = None
+    try:
+        default_store = session.DefaultStore.StoreID
+        for acc in accounts:
+            try:
+                if acc.DeliveryStore.StoreID == default_store:
+                    default = acc
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return accounts, default or (accounts[0] if accounts else None)
+
+
+def set_send_account(mail, account):
+    try:
+        mail.SendUsingAccount = account
+    except Exception:
+        # Late-bound pywin32 sometimes refuses the property set; call it by DISPID instead
+        mail._oleobj_.Invoke(DISPID_SEND_USING_ACCOUNT, 0, 8, 0, account)
 
 
 # --- Helper function for script path ---
@@ -138,6 +195,33 @@ def is_valid_email(email):
     return bool(email) and '@' in email
 
 
+def compute_statuses(recipients, sent, failed, batch_size):
+    """Returns [(recipient, status, detail)] in list order, plus counts per status"""
+    rows, seen = [], set()
+    counts = {s: 0 for s in (ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE)}
+    next_left = batch_size
+    for r in recipients:
+        key = r['email'].lower()
+        if not is_valid_email(r['email']):
+            status, detail = ST_INVALID, ""
+        elif key in seen:
+            status, detail = ST_DUPLICATE, "Same address appears earlier in the list"
+        elif key in sent:
+            status, detail = ST_SENT, sent[key] or ""
+        elif key in failed:
+            status, detail = ST_FAILED, failed[key] or ""
+        elif next_left > 0:
+            status, detail = ST_NEXT, ""
+            next_left -= 1
+        else:
+            status, detail = ST_PENDING, ""
+        if is_valid_email(r['email']):
+            seen.add(key)
+        counts[status] += 1
+        rows.append((r, status, detail))
+    return rows, counts
+
+
 class ProgressStore:
     """Remembers settings and which addresses were already sent, in a JSON file next to the program.
     Progress is kept per (Excel list + template) pair, so a new template starts the list from the top."""
@@ -156,26 +240,39 @@ class ProgressStore:
         except Exception:
             # Keep the unreadable file instead of silently overwriting the user's progress
             os.replace(path, path + ".broken")
+        for c in self.data["campaigns"].values():
+            # Older versions stored plain lists of addresses
+            for field in ("sent", "failed"):
+                if isinstance(c.get(field), list):
+                    c[field] = {e: None for e in c[field]}
 
     @staticmethod
     def key(excel_file, template_file):
         norm = lambda p: os.path.normcase(os.path.abspath(p))
         return norm(excel_file) + "|" + norm(template_file)
 
-    def campaign(self, excel_file, template_file):
-        with self.lock:
-            c = self.data["campaigns"].setdefault(self.key(excel_file, template_file), {
-                "excel": excel_file, "template": template_file, "sent": [], "failed": []})
-            return set(c["sent"]), set(c["failed"])
+    def _campaign(self, excel_file, template_file):
+        return self.data["campaigns"].setdefault(self.key(excel_file, template_file), {
+            "excel": excel_file, "template": template_file, "sent": {}, "failed": {}})
 
-    def mark(self, excel_file, template_file, email, ok):
+    def campaign(self, excel_file, template_file):
+        """Returns copies of ({email: sent_time}, {email: error}) for this list + template"""
         with self.lock:
-            c = self.data["campaigns"].setdefault(self.key(excel_file, template_file), {
-                "excel": excel_file, "template": template_file, "sent": [], "failed": []})
-            target = c["sent"] if ok else c["failed"]
-            if email.lower() not in target:
-                target.append(email.lower())
-            c["updated"] = datetime.now().isoformat(timespec="seconds")
+            c = self.data["campaigns"].get(self.key(excel_file, template_file))
+            if not c:
+                return {}, {}
+            return dict(c["sent"]), dict(c["failed"])
+
+    def mark(self, excel_file, template_file, email, ok, error=None):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with self.lock:
+            c = self._campaign(excel_file, template_file)
+            if ok:
+                c["sent"][email.lower()] = now
+                c["failed"].pop(email.lower(), None)
+            else:
+                c["failed"][email.lower()] = f"{now}: {error}"
+            c["updated"] = now
         self.save()
 
     def reset(self, excel_file, template_file):
@@ -205,7 +302,8 @@ class EmailSenderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("My Baskets Email Sender (HTML/OFT Supported)") # 软件标题
-        self.root.geometry("620x680")
+        self.root.geometry("820x720")
+        self.root.minsize(700, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Stored variables
@@ -215,63 +313,108 @@ class EmailSenderApp:
         self.subject_template = tk.StringVar(value=self.store.get_setting("subject", "Hello {{FirstName}} From My Baskets"))
         self.batch_size = tk.StringVar(value=str(self.store.get_setting("batch_size", DEFAULT_BATCH_SIZE)))
         self.delay_seconds = tk.StringVar(value=str(self.store.get_setting("delay_seconds", DEFAULT_DELAY_SECONDS)))
+        self.sender = tk.StringVar(value=self.store.get_setting("sender", ""))
+        self.outlook_status = tk.StringVar(value="Not checked")
         self.status_text = tk.StringVar(value="Select a customer list and template.")
+        self.list_filter = tk.StringVar(value="All")
         self.is_running = False
+        self.is_checking = False
+        self.recipients = []  # cached customer list for the table
         self._status_job = None
 
         # --- UI Layout ---
 
-        # 1. Select Excel File
-        frame_excel = tk.LabelFrame(root, text="1. Select Customer List (Excel)", padx=10, pady=10) # 标签
-        frame_excel.pack(fill="x", padx=10, pady=5)
+        # 0. Outlook connection + sending account
+        frame_ol = tk.LabelFrame(root, text="Outlook Connection", padx=10, pady=5) # 标签
+        frame_ol.pack(fill="x", padx=10, pady=3)
+        tk.Label(frame_ol, text="Send from:").pack(side=tk.LEFT) # 标签
+        self.sender_box = ttk.Combobox(frame_ol, textvariable=self.sender, state="readonly", width=34)
+        self.sender_box.pack(side=tk.LEFT, padx=5)
+        self.btn_check = tk.Button(frame_ol, text="Check Connection", command=self.check_connection) # 按钮
+        self.btn_check.pack(side=tk.LEFT, padx=5)
+        self.lbl_outlook = tk.Label(frame_ol, textvariable=self.outlook_status, fg="gray", font=("Arial", 9, "bold"))
+        self.lbl_outlook.pack(side=tk.LEFT, padx=5)
+        self.sender.trace_add("write", lambda *_: self.store.set_settings(sender=self.sender.get()))
 
-        tk.Entry(frame_excel, textvariable=self.excel_path, width=50).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_excel, text="Browse...", command=self.select_excel).pack(side=tk.LEFT) # 按钮
+        # 1. Files
+        frame_files = tk.LabelFrame(root, text="1. Files", padx=10, pady=5) # 标签
+        frame_files.pack(fill="x", padx=10, pady=3)
+        frame_files.columnconfigure(1, weight=1)
+        tk.Label(frame_files, text="Customer list (Excel):").grid(row=0, column=0, sticky="w") # 标签
+        tk.Entry(frame_files, textvariable=self.excel_path).grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        tk.Button(frame_files, text="Browse...", command=self.select_excel).grid(row=0, column=2) # 按钮
+        tk.Label(frame_files, text="Template (.oft / .html):").grid(row=1, column=0, sticky="w") # 标签
+        tk.Entry(frame_files, textvariable=self.template_path).grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        tk.Button(frame_files, text="Browse...", command=self.select_template).grid(row=1, column=2) # 按钮
 
-        # 2. Select Outlook Template
-        frame_tmpl = tk.LabelFrame(root, text="2. Select Email Template (.oft or .html)", padx=10, pady=10) # 标签
-        frame_tmpl.pack(fill="x", padx=10, pady=5)
-
-        tk.Entry(frame_tmpl, textvariable=self.template_path, width=50).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_tmpl, text="Browse...", command=self.select_template).pack(side=tk.LEFT) # 按钮
-
-        # 3. Set Subject Line
-        frame_subj = tk.LabelFrame(root, text="3. Set Email Subject ({{FirstName}}, {{Company}}, any column)", padx=10, pady=10) # 标签
-        frame_subj.pack(fill="x", padx=10, pady=5)
-        tk.Entry(frame_subj, textvariable=self.subject_template, width=60).pack(padx=5)
-
-        # 4. Batch settings
-        frame_batch = tk.LabelFrame(root, text="4. Batch Settings", padx=10, pady=10) # 标签
-        frame_batch.pack(fill="x", padx=10, pady=5)
+        # 2. Subject + batch settings
+        frame_mail = tk.LabelFrame(root, text="2. Subject ({{FirstName}}, {{Company}}, any column) and Batch Settings", padx=10, pady=5) # 标签
+        frame_mail.pack(fill="x", padx=10, pady=3)
+        tk.Entry(frame_mail, textvariable=self.subject_template).pack(fill="x", pady=(0, 5))
+        frame_batch = tk.Frame(frame_mail)
+        frame_batch.pack(fill="x")
         tk.Label(frame_batch, text="Emails per batch:").pack(side=tk.LEFT) # 标签
-        tk.Spinbox(frame_batch, from_=1, to=1000, textvariable=self.batch_size, width=6,
-                   command=self.update_button_text).pack(side=tk.LEFT, padx=(5, 20))
+        tk.Spinbox(frame_batch, from_=1, to=1000, textvariable=self.batch_size, width=6).pack(side=tk.LEFT, padx=(5, 20))
         tk.Label(frame_batch, text="Seconds between emails:").pack(side=tk.LEFT) # 标签
         tk.Spinbox(frame_batch, from_=0, to=600, textvariable=self.delay_seconds, width=6).pack(side=tk.LEFT, padx=5)
-        self.batch_size.trace_add("write", lambda *_: self.update_button_text())
+        self.batch_size.trace_add("write", lambda *_: self.on_batch_size_change())
 
-        # 5. Progress + Action Buttons
-        frame_btn = tk.Frame(root, pady=10)
+        # 3. Progress + Action Buttons
+        frame_btn = tk.Frame(root, pady=5)
         frame_btn.pack()
-        tk.Label(frame_btn, textvariable=self.status_text, font=("Arial", 10, "bold")).pack(pady=(0, 8)) # 标签
+        tk.Label(frame_btn, textvariable=self.status_text, font=("Arial", 10, "bold")).pack(pady=(0, 5)) # 标签
         self.btn_start = tk.Button(frame_btn, text="Send Next Batch", command=self.toggle_sending, bg="#4CAF50", fg="white", font=("Arial", 12, "bold"), width=18) # 按钮
         self.btn_start.pack(side=tk.LEFT, padx=5)
         self.btn_reset = tk.Button(frame_btn, text="Reset Progress", command=self.reset_progress) # 按钮
         self.btn_reset.pack(side=tk.LEFT, padx=5)
 
-        # 6. Execution Log
-        tk.Label(root, text="Execution Log:").pack(anchor="w", padx=10) # 标签
-        self.log_area = scrolledtext.ScrolledText(root, height=15)
-        self.log_area.pack(fill="both", expand=True, padx=10, pady=5)
+        # 4. Customers table + Execution Log (tabs)
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=5)
+
+        tab_customers = tk.Frame(notebook)
+        notebook.add(tab_customers, text="Customers") # 标签
+        bar = tk.Frame(tab_customers)
+        bar.pack(fill="x", pady=3)
+        tk.Button(bar, text="Load / Refresh List", command=self.load_customer_list).pack(side=tk.LEFT) # 按钮
+        tk.Label(bar, text="Show:").pack(side=tk.LEFT, padx=(15, 5)) # 标签
+        filter_box = ttk.Combobox(bar, textvariable=self.list_filter, values=list(STATUS_FILTERS), state="readonly", width=14)
+        filter_box.pack(side=tk.LEFT)
+        filter_box.bind("<<ComboboxSelected>>", lambda _: self.refresh_status())
+
+        table_frame = tk.Frame(tab_customers)
+        table_frame.pack(fill="both", expand=True)
+        columns = ("row", "name", "email", "status", "detail")
+        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+        for col, title, width, stretch in (("row", "Row", 50, False), ("name", "First Name", 120, False),
+                                           ("email", "Email", 230, True), ("status", "Status", 100, False),
+                                           ("detail", "Sent Time / Error", 220, True)):
+            self.table.heading(col, text=title)
+            self.table.column(col, width=width, stretch=stretch, anchor="w")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
+        self.table.configure(yscrollcommand=scroll.set)
+        self.table.pack(side=tk.LEFT, fill="both", expand=True)
+        scroll.pack(side=tk.RIGHT, fill="y")
+        self.table.tag_configure(ST_SENT, foreground="#2e7d32")
+        self.table.tag_configure(ST_FAILED, foreground="#c62828")
+        self.table.tag_configure(ST_NEXT, foreground="#1565c0")
+        self.table.tag_configure(ST_INVALID, foreground="gray")
+        self.table.tag_configure(ST_DUPLICATE, foreground="gray")
+
+        tab_log = tk.Frame(notebook)
+        notebook.add(tab_log, text="Execution Log") # 标签
+        self.log_area = scrolledtext.ScrolledText(tab_log, height=10)
+        self.log_area.pack(fill="both", expand=True)
 
         self.auto_load_files()
-        self.excel_path.trace_add("write", lambda *_: self.schedule_status_refresh())
-        self.template_path.trace_add("write", lambda *_: self.schedule_status_refresh())
+        self.excel_path.trace_add("write", lambda *_: self.schedule_list_reload())
+        self.template_path.trace_add("write", lambda *_: self.schedule_list_reload())
         self.update_button_text()
-        self.refresh_status()
+        self.load_customer_list()
         if is_admin():
             self.log("Warning: running as Administrator. If Outlook is not also running as Administrator, "
                      "the connection will fail - start this program normally instead.") # 日志
+        self.root.after(300, self.check_connection)
 
     # --- Thread-safe UI helpers (Tkinter must only be touched from the main thread) ---
 
@@ -326,6 +469,58 @@ class EmailSenderApp:
         if filename:
             self.template_path.set(filename)
 
+    # --- Outlook connection check ---
+
+    def check_connection(self):
+        if self.is_checking or self.is_running:
+            return
+        self.is_checking = True
+        self.btn_check.config(state="disabled")
+        self.set_outlook_status("Checking...", "gray")
+        threading.Thread(target=self._check_connection_worker, daemon=True).start()
+
+    def _check_connection_worker(self):
+        pythoncom.CoInitialize()
+        try:
+            outlook = connect_outlook()
+            accounts, default = get_accounts(outlook)
+            addresses = [account_address(a) for a in accounts]
+            default_addr = account_address(default) if default else ""
+            self.ui(self._on_connection_ok, addresses, default_addr)
+        except Exception as e:
+            self.log(f"Outlook check failed: {e}") # 日志
+            hint = explain_outlook_error(e)
+            if hint:
+                self.log(hint) # 日志
+            self.ui(self._on_connection_failed)
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _on_connection_ok(self, addresses, default_addr):
+        self.is_checking = False
+        self.btn_check.config(state="normal")
+        self.sender_box.config(values=addresses)
+        if not addresses:
+            self.set_outlook_status("Connected, but no email accounts found", "#c62828")
+            self.log("Outlook is running but has no email accounts set up.") # 日志
+            return
+        # Keep the remembered sender if it still exists, otherwise use Outlook's default account
+        if self.sender.get().lower() not in [a.lower() for a in addresses]:
+            self.sender.set(default_addr or addresses[0])
+        self.set_outlook_status(f"Connected ({len(addresses)} account(s))", "#2e7d32")
+        self.log(f"Outlook connected. Accounts: {', '.join(addresses)}. Default: {default_addr}") # 日志
+
+    def _on_connection_failed(self):
+        self.is_checking = False
+        self.btn_check.config(state="normal")
+        self.set_outlook_status("Not connected - see Execution Log", "#c62828")
+
+    def set_outlook_status(self, text, color):
+        self.outlook_status.set(text)
+        self.lbl_outlook.config(fg=color)
+
+    # --- Customer list + progress ---
+
     def get_batch_settings(self):
         """Returns (batch_size, delay_seconds) or None if the inputs aren't valid numbers"""
         try:
@@ -343,31 +538,63 @@ class EmailSenderApp:
         settings = self.get_batch_settings()
         self.btn_start.config(text=f"Send Next {settings[0]}" if settings else "Send Next Batch") # 按钮文本
 
-    def schedule_status_refresh(self):
+    def on_batch_size_change(self):
+        self.update_button_text()
+        if not self.is_running:
+            self.refresh_status()
+
+    def schedule_list_reload(self):
         # Wait until the user stops typing a path before re-reading the Excel file
         if self._status_job is not None:
             self.root.after_cancel(self._status_job)
-        self._status_job = self.root.after(500, self.refresh_status)
+        self._status_job = self.root.after(500, self.load_customer_list)
 
-    def refresh_status(self):
-        """Shows how far through the current list we are (main thread only)"""
+    def load_customer_list(self):
+        """Reads the Excel file into the Customers table (main thread only)"""
         self._status_job = None
         excel_file = self.excel_path.get().strip()
-        template_file = self.template_path.get().strip()
-        if not (os.path.isfile(excel_file) and os.path.isfile(template_file)):
+        self.recipients = []
+        if not os.path.isfile(excel_file):
             self.status_text.set("Select a customer list and template.")
+            self.table.delete(*self.table.get_children())
             return
         try:
-            _, recipients, _ = load_recipients(excel_file)
+            _, self.recipients, _ = load_recipients(excel_file)
         except Exception as e:
-            self.status_text.set(f"Can't read list: {e}")
+            self.status_text.set("Can't read the customer list - see Execution Log")
+            self.log(f"Error reading customer list: {e}") # 日志
+            self.table.delete(*self.table.get_children())
             return
-        sent, failed = self.store.campaign(excel_file, template_file)
-        valid = {r['email'].lower() for r in recipients if is_valid_email(r['email'])}
-        done_sent = len(valid & sent)
-        done_failed = len(valid & failed - sent)
-        remaining = len(valid) - done_sent - done_failed
-        self.status_text.set(f"Sent {done_sent} of {len(valid)}  |  Failed {done_failed}  |  Remaining {remaining}")
+        self.refresh_status()
+
+    def refresh_status(self):
+        """Re-marks every customer as Sent / Failed / Next batch / Pending and updates the summary"""
+        excel_file = self.excel_path.get().strip()
+        template_file = self.template_path.get().strip()
+        if not self.recipients:
+            return
+        if os.path.isfile(template_file):
+            sent, failed = self.store.campaign(excel_file, template_file)
+        else:
+            sent, failed = {}, {}
+        settings = self.get_batch_settings()
+        rows, counts = compute_statuses(self.recipients, sent, failed, settings[0] if settings else DEFAULT_BATCH_SIZE)
+
+        show = STATUS_FILTERS.get(self.list_filter.get())
+        self.table.delete(*self.table.get_children())
+        for r, status, detail in rows:
+            if show is None or status in show:
+                self.table.insert("", tk.END, values=(r['row'], r['name'], r['email'], status, detail), tags=(status,))
+
+        total = counts[ST_SENT] + counts[ST_FAILED] + counts[ST_NEXT] + counts[ST_PENDING]
+        remaining = counts[ST_NEXT] + counts[ST_PENDING]
+        skipped = counts[ST_INVALID] + counts[ST_DUPLICATE]
+        text = f"Sent {counts[ST_SENT]} of {total}  |  Failed {counts[ST_FAILED]}  |  Remaining {remaining}"
+        if skipped:
+            text += f"  |  Skipped {skipped}"
+        if not os.path.isfile(template_file):
+            text += "  (select a template to see progress)"
+        self.status_text.set(text)
 
     def reset_progress(self):
         excel_file = self.excel_path.get().strip()
@@ -380,6 +607,8 @@ class EmailSenderApp:
             self.store.reset(excel_file, template_file)
             self.log("Progress reset. Next batch starts from the top of the list.") # 日志
             self.refresh_status()
+
+    # --- Sending ---
 
     def toggle_sending(self):
         if self.is_running:
@@ -400,6 +629,13 @@ class EmailSenderApp:
             if not os.path.isfile(path):
                 messagebox.showwarning("Warning", f"File not found:\n{path}") # 提示框
                 return
+        if self.is_checking:
+            messagebox.showwarning("Warning", "Still checking the Outlook connection, please wait a moment.") # 提示框
+            return
+        sender = self.sender.get().strip()
+        if not sender:
+            messagebox.showwarning("Warning", "No sending account selected. Click 'Check Connection' first.") # 提示框
+            return
 
         settings = self.get_batch_settings()
         if settings is None:
@@ -407,20 +643,24 @@ class EmailSenderApp:
             return
         batch_size, delay = settings
 
+        if not messagebox.askyesno("Confirm", f"Send the next {batch_size} email(s) from:\n\n{sender}\n\nContinue?"): # 提示框
+            return
+
         # Read Tk variables here, in the main thread
         subject_tmpl = self.subject_template.get()
         self.store.set_settings(excel=excel_file, template=template_file, subject=subject_tmpl,
-                                batch_size=batch_size, delay_seconds=delay)
+                                batch_size=batch_size, delay_seconds=delay, sender=sender)
 
         self.is_running = True
         self.btn_start.config(text="Stop", bg="#f44336") # 按钮文本
         self.btn_reset.config(state="disabled")
+        self.btn_check.config(state="disabled")
         thread = threading.Thread(target=self.run_sending_process,
-                                  args=(excel_file, template_file, subject_tmpl, batch_size, delay))
+                                  args=(excel_file, template_file, subject_tmpl, batch_size, delay, sender))
         thread.daemon = True
         thread.start()
 
-    def run_sending_process(self, excel_file, template_file, subject_tmpl, batch_size, delay):
+    def run_sending_process(self, excel_file, template_file, subject_tmpl, batch_size, delay, sender):
         # COM must be initialized on every thread that uses it
         pythoncom.CoInitialize()
         success_count = 0
@@ -437,7 +677,7 @@ class EmailSenderApp:
 
             # Pick the next batch: valid addresses not already sent/failed, first occurrence only
             sent, failed = self.store.campaign(excel_file, template_file)
-            done = sent | failed
+            done = set(sent) | set(failed)
             batch, seen = [], set()
             for r in recipients:
                 key = r['email'].lower()
@@ -470,16 +710,19 @@ class EmailSenderApp:
 
             try:
                 outlook = connect_outlook()
+                accounts, _ = get_accounts(outlook)
             except Exception as e:
                 self.log(f"Error: Could not connect to Outlook. Ensure Classic Outlook is open. ({e})") # 日志
-                if getattr(e, 'hresult', None) == CO_E_SERVER_EXEC_FAILURE or (e.args and e.args[0] == CO_E_SERVER_EXEC_FAILURE):
-                    if is_admin():
-                        self.log("Cause: this program is running as Administrator but Outlook is not. "
-                                 "Close it and start it normally (not 'Run as administrator').") # 日志
-                    else:
-                        self.log("Cause: Outlook seems to be running as Administrator, or is still starting/busy. "
-                                 "Close Outlook completely (check Task Manager), reopen it normally, wait until it has loaded, then try again.") # 日志
+                hint = explain_outlook_error(e)
+                if hint:
+                    self.log(hint) # 日志
                 return
+
+            account = next((a for a in accounts if account_address(a).lower() == sender.lower()), None)
+            if account is None:
+                self.log(f"Error: The account '{sender}' was not found in Outlook. Click 'Check Connection' and pick an account.") # 日志
+                return
+            self.log(f"Sending from: {sender}") # 日志
 
             # --- Make sure every {{placeholder}} matches an Excel column before sending anything ---
             body_text = html_content if html_content is not None else (outlook.CreateItemFromTemplate(template_file).HTMLBody or "")
@@ -506,6 +749,7 @@ class EmailSenderApp:
                         if mail.HTMLBody:
                             mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
 
+                    set_send_account(mail, account)
                     mail.To = email
                     mail.Subject = fill_placeholders(subject_tmpl, values)
                     mail.Send()
@@ -515,7 +759,7 @@ class EmailSenderApp:
                     success_count += 1
 
                 except Exception as e:
-                    self.store.mark(excel_file, template_file, email, ok=False)
+                    self.store.mark(excel_file, template_file, email, ok=False, error=str(e))
                     self.log(f"[{pos}/{total}] Failed to send ({email}) - Excel row {r['row']}: {e}") # 日志
                     failed_count += 1
 
@@ -547,8 +791,9 @@ class EmailSenderApp:
         self.is_running = False
         self.btn_start.config(state="normal", bg="#4CAF50")
         self.btn_reset.config(state="normal")
+        self.btn_check.config(state="normal")
         self.update_button_text()
-        self.refresh_status()
+        self.load_customer_list()
 
     def on_close(self):
         if self.is_running and not messagebox.askyesno("Quit", "Emails are still being sent. Stop and quit?"):
@@ -556,7 +801,7 @@ class EmailSenderApp:
         self.is_running = False
         settings = self.get_batch_settings()
         self.store.set_settings(excel=self.excel_path.get().strip(), template=self.template_path.get().strip(),
-                                subject=self.subject_template.get(),
+                                subject=self.subject_template.get(), sender=self.sender.get(),
                                 **({"batch_size": settings[0], "delay_seconds": settings[1]} if settings else {}))
         self.root.destroy()
 

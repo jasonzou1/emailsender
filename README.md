@@ -11,6 +11,8 @@ python email_sender.py
 
 ## Usage
 
+0. **Outlook Connection** – the app checks Outlook when it opens (or click **Check Connection**). The status turns green and **Send from** lists every email account in Outlook; pick the one to send from. Your choice is remembered, and you're asked to confirm the sending address before every batch.
+
 1. **Excel** – needs an `Email` column plus either:
    - a `FirstName` column, or
    - a full-name column (`Name`, `Full Name`, `Customer Name`, ...) – the first word is used, so `Anna Smith` → `Anna` (and `Smith, Anna` → `Anna`).
@@ -33,6 +35,20 @@ Use `{{ColumnName}}` for **any** column in your Excel, e.g. `{{FirstName}}`, `{{
 
 4. **Batch settings** – how many emails per batch (default 20) and seconds to wait between emails (default 5).
 5. Click **Send Next 20**. It sends one batch and stops. Click it again whenever you're ready for the next batch. **Stop** halts mid-batch.
+
+### Customers tab
+
+Shows every row of the Excel list with its status:
+
+| Status | Meaning |
+|---|---|
+| **Sent** (green) | Already emailed – the time it was sent is shown |
+| **Failed** (red) | Outlook refused it – the error is shown; not retried automatically |
+| **Next batch** (blue) | Will be sent when you click **Send Next** |
+| **Pending** | Not sent yet, in a later batch |
+| **Invalid email** / **Duplicate** (gray) | Skipped |
+
+Use **Show** to filter (All / Not sent yet / Sent / Failed / Skipped) and **Load / Refresh List** after editing the Excel file. The table updates live while a batch is sending. The full step-by-step log is in the **Execution Log** tab.
 
 ### Remembering where you are
 
