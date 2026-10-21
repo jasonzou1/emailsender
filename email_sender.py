@@ -11,7 +11,8 @@ import threading
 import sys
 import ctypes
 import json
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 
 CO_E_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005
 DISPID_SEND_USING_ACCOUNT = 64209
@@ -23,7 +24,9 @@ FULL_NAME_HEADERS = ("name", "fullname", "customername", "clientname", "contactn
 
 STATE_FILENAME = "email_sender_progress.json"
 DEFAULT_BATCH_SIZE = 20
-DEFAULT_DELAY_SECONDS = 5
+DEFAULT_DELAY_MIN = 30
+DEFAULT_DELAY_MAX = 60
+DEFAULT_BATCH_GAP_MINUTES = 30
 
 # Customer status labels shown in the table
 ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE = (
@@ -312,7 +315,12 @@ class EmailSenderApp:
         self.store = ProgressStore(os.path.join(get_script_dir(), STATE_FILENAME))
         self.subject_template = tk.StringVar(value=self.store.get_setting("subject", "Hello {{FirstName}} From My Baskets"))
         self.batch_size = tk.StringVar(value=str(self.store.get_setting("batch_size", DEFAULT_BATCH_SIZE)))
-        self.delay_seconds = tk.StringVar(value=str(self.store.get_setting("delay_seconds", DEFAULT_DELAY_SECONDS)))
+        self.delay_min = tk.StringVar(value=str(self.store.get_setting("delay_min", self.store.get_setting("delay_seconds", DEFAULT_DELAY_MIN))))
+        self.delay_max = tk.StringVar(value=str(self.store.get_setting("delay_max", DEFAULT_DELAY_MAX)))
+        self.batch_gap = tk.StringVar(value=str(self.store.get_setting("batch_gap_minutes", DEFAULT_BATCH_GAP_MINUTES)))
+        self.auto_continue = tk.BooleanVar(value=self.store.get_setting("auto_continue", False))
+        self.countdown_text = tk.StringVar(value="")
+        self.next_batch_at = None  # datetime while waiting between batches in auto mode
         self.sender = tk.StringVar(value=self.store.get_setting("sender", ""))
         self.outlook_status = tk.StringVar(value="Not checked")
         self.status_text = tk.StringVar(value="Select a customer list and template.")
@@ -320,6 +328,7 @@ class EmailSenderApp:
         self.is_running = False
         self.is_checking = False
         self.recipients = []  # cached customer list for the table
+        self.remaining_count = 0
         self._status_job = None
 
         # --- UI Layout ---
@@ -354,15 +363,25 @@ class EmailSenderApp:
         frame_batch = tk.Frame(frame_mail)
         frame_batch.pack(fill="x")
         tk.Label(frame_batch, text="Emails per batch:").pack(side=tk.LEFT) # 标签
-        tk.Spinbox(frame_batch, from_=1, to=1000, textvariable=self.batch_size, width=6).pack(side=tk.LEFT, padx=(5, 20))
-        tk.Label(frame_batch, text="Seconds between emails:").pack(side=tk.LEFT) # 标签
-        tk.Spinbox(frame_batch, from_=0, to=600, textvariable=self.delay_seconds, width=6).pack(side=tk.LEFT, padx=5)
+        tk.Spinbox(frame_batch, from_=1, to=1000, textvariable=self.batch_size, width=5).pack(side=tk.LEFT, padx=(5, 20))
+        tk.Label(frame_batch, text="Random wait between emails:").pack(side=tk.LEFT) # 标签
+        tk.Spinbox(frame_batch, from_=0, to=600, textvariable=self.delay_min, width=5).pack(side=tk.LEFT, padx=5)
+        tk.Label(frame_batch, text="to").pack(side=tk.LEFT) # 标签
+        tk.Spinbox(frame_batch, from_=0, to=600, textvariable=self.delay_max, width=5).pack(side=tk.LEFT, padx=5)
+        tk.Label(frame_batch, text="seconds").pack(side=tk.LEFT) # 标签
+        frame_gap = tk.Frame(frame_mail)
+        frame_gap.pack(fill="x", pady=(5, 0))
+        tk.Label(frame_gap, text="Minutes between batches:").pack(side=tk.LEFT) # 标签
+        tk.Spinbox(frame_gap, from_=0, to=1440, textvariable=self.batch_gap, width=5).pack(side=tk.LEFT, padx=(5, 20))
+        tk.Checkbutton(frame_gap, text="Automatically send the next batch after the gap (until the list is done)",
+                       variable=self.auto_continue, command=self.update_button_text).pack(side=tk.LEFT) # 标签
         self.batch_size.trace_add("write", lambda *_: self.on_batch_size_change())
 
         # 3. Progress + Action Buttons
         frame_btn = tk.Frame(root, pady=5)
         frame_btn.pack()
-        tk.Label(frame_btn, textvariable=self.status_text, font=("Arial", 10, "bold")).pack(pady=(0, 5)) # 标签
+        tk.Label(frame_btn, textvariable=self.status_text, font=("Arial", 10, "bold")).pack() # 标签
+        tk.Label(frame_btn, textvariable=self.countdown_text, fg="#1565c0").pack(pady=(0, 5)) # 标签
         self.btn_start = tk.Button(frame_btn, text="Send Next Batch", command=self.toggle_sending, bg="#4CAF50", fg="white", font=("Arial", 12, "bold"), width=18) # 按钮
         self.btn_start.pack(side=tk.LEFT, padx=5)
         self.btn_reset = tk.Button(frame_btn, text="Reset Progress", command=self.reset_progress) # 按钮
@@ -415,6 +434,7 @@ class EmailSenderApp:
             self.log("Warning: running as Administrator. If Outlook is not also running as Administrator, "
                      "the connection will fail - start this program normally instead.") # 日志
         self.root.after(300, self.check_connection)
+        self.tick_countdown()
 
     # --- Thread-safe UI helpers (Tkinter must only be touched from the main thread) ---
 
@@ -522,21 +542,66 @@ class EmailSenderApp:
     # --- Customer list + progress ---
 
     def get_batch_settings(self):
-        """Returns (batch_size, delay_seconds) or None if the inputs aren't valid numbers"""
+        """Returns (batch_size, delay_min, delay_max, gap_minutes) or None if the inputs aren't valid"""
         try:
             batch = int(self.batch_size.get())
-            delay = float(self.delay_seconds.get())
+            delay_min = float(self.delay_min.get())
+            delay_max = float(self.delay_max.get())
+            gap = float(self.batch_gap.get())
         except ValueError:
             return None
-        if batch < 1 or delay < 0:
+        if batch < 1 or delay_min < 0 or delay_max < delay_min or gap < 0:
             return None
-        return batch, delay
+        return batch, delay_min, delay_max, gap
+
+    def settings_to_store(self, settings):
+        batch, delay_min, delay_max, gap = settings
+        return {"batch_size": batch, "delay_min": delay_min, "delay_max": delay_max,
+                "batch_gap_minutes": gap, "auto_continue": self.auto_continue.get()}
 
     def update_button_text(self):
         if self.is_running:
             return
         settings = self.get_batch_settings()
-        self.btn_start.config(text=f"Send Next {settings[0]}" if settings else "Send Next Batch") # 按钮文本
+        if not settings:
+            text = "Send Next Batch"
+        elif self.auto_continue.get():
+            text = f"Start Auto ({settings[0]} per batch)"
+        else:
+            text = f"Send Next {settings[0]}"
+        self.btn_start.config(text=text) # 按钮文本
+
+    def gap_remaining(self, gap_minutes):
+        """Time left before the gap after the last finished batch is over, or None"""
+        last = self.store.get_setting("last_batch_end")
+        if not last or gap_minutes <= 0:
+            return None
+        try:
+            ready = datetime.fromisoformat(last) + timedelta(minutes=gap_minutes)
+        except ValueError:
+            return None
+        left = ready - datetime.now()
+        return left if left.total_seconds() > 0 else None
+
+    @staticmethod
+    def fmt_delta(delta):
+        secs = int(delta.total_seconds())
+        return f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
+
+    def tick_countdown(self):
+        """Updates the 'next batch' line once a second"""
+        if self.next_batch_at is not None:
+            left = self.next_batch_at - datetime.now()
+            self.countdown_text.set(f"Waiting between batches - next batch starts at "
+                                    f"{self.next_batch_at:%H:%M} (in {self.fmt_delta(max(left, timedelta(0)))})")
+        elif not self.is_running:
+            settings = self.get_batch_settings()
+            left = self.gap_remaining(settings[3]) if settings and self.remaining_count else None
+            show = left is not None and left.total_seconds() >= 1
+            self.countdown_text.set(f"Batch gap: next batch recommended in {self.fmt_delta(left)}" if show else "")
+        else:
+            self.countdown_text.set("")
+        self.root.after(1000, self.tick_countdown)
 
     def on_batch_size_change(self):
         self.update_button_text()
@@ -588,6 +653,7 @@ class EmailSenderApp:
 
         total = counts[ST_SENT] + counts[ST_FAILED] + counts[ST_NEXT] + counts[ST_PENDING]
         remaining = counts[ST_NEXT] + counts[ST_PENDING]
+        self.remaining_count = remaining
         skipped = counts[ST_INVALID] + counts[ST_DUPLICATE]
         text = f"Sent {counts[ST_SENT]} of {total}  |  Failed {counts[ST_FAILED]}  |  Remaining {remaining}"
         if skipped:
@@ -639,32 +705,50 @@ class EmailSenderApp:
 
         settings = self.get_batch_settings()
         if settings is None:
-            messagebox.showwarning("Warning", "Emails per batch must be 1 or more, and seconds between emails 0 or more.") # 提示框
+            messagebox.showwarning("Warning", "Please check the batch settings:\n\n"
+                                   "- Emails per batch: 1 or more\n"
+                                   "- Random wait: numbers 0 or more, and the second must not be smaller than the first\n"
+                                   "- Minutes between batches: 0 or more") # 提示框
             return
-        batch_size, delay = settings
+        batch_size, delay_min, delay_max, gap = settings
+        auto = self.auto_continue.get()
 
-        if not messagebox.askyesno("Confirm", f"Send the next {batch_size} email(s) from:\n\n{sender}\n\nContinue?"): # 提示框
+        left = self.gap_remaining(gap)
+        if left and not messagebox.askyesno(
+                "Batch Gap", f"The last batch finished less than {gap:g} minutes ago.\n"
+                             f"The gap ends in {self.fmt_delta(left)}.\n\nSend anyway?"): # 提示框
+            return
+
+        wait_text = f"{delay_min:g}-{delay_max:g} seconds" if delay_max > delay_min else f"{delay_min:g} seconds"
+        if auto:
+            question = (f"Send ALL remaining emails from:\n\n{sender}\n\n"
+                        f"in batches of {batch_size}, waiting {wait_text} between emails "
+                        f"and {gap:g} minutes between batches.\n\nKeep this program and Outlook open. Continue?")
+        else:
+            question = (f"Send the next {batch_size} email(s) from:\n\n{sender}\n\n"
+                        f"waiting {wait_text} between emails.\n\nContinue?")
+        if not messagebox.askyesno("Confirm", question): # 提示框
             return
 
         # Read Tk variables here, in the main thread
         subject_tmpl = self.subject_template.get()
         self.store.set_settings(excel=excel_file, template=template_file, subject=subject_tmpl,
-                                batch_size=batch_size, delay_seconds=delay, sender=sender)
+                                sender=sender, **self.settings_to_store(settings))
 
         self.is_running = True
         self.btn_start.config(text="Stop", bg="#f44336") # 按钮文本
         self.btn_reset.config(state="disabled")
         self.btn_check.config(state="disabled")
         thread = threading.Thread(target=self.run_sending_process,
-                                  args=(excel_file, template_file, subject_tmpl, batch_size, delay, sender))
+                                  args=(excel_file, template_file, subject_tmpl, batch_size,
+                                        delay_min, delay_max, gap, auto, sender))
         thread.daemon = True
         thread.start()
 
-    def run_sending_process(self, excel_file, template_file, subject_tmpl, batch_size, delay, sender):
+    def run_sending_process(self, excel_file, template_file, subject_tmpl, batch_size,
+                            delay_min, delay_max, gap_minutes, auto, sender):
         # COM must be initialized on every thread that uses it
         pythoncom.CoInitialize()
-        success_count = 0
-        failed_count = 0
         try:
             self.log("-" * 30)
             self.log("Reading Excel file...") # 日志
@@ -674,28 +758,6 @@ class EmailSenderApp:
                 self.log(f"Error: {e}") # 日志
                 return
             self.log(info) # 日志
-
-            # Pick the next batch: valid addresses not already sent/failed, first occurrence only
-            sent, failed = self.store.campaign(excel_file, template_file)
-            done = set(sent) | set(failed)
-            batch, seen = [], set()
-            for r in recipients:
-                key = r['email'].lower()
-                if not is_valid_email(r['email']) or key in done or key in seen:
-                    continue
-                seen.add(key)
-                batch.append(r)
-                if len(batch) >= batch_size:
-                    break
-            remaining_total = len({r['email'].lower() for r in recipients if is_valid_email(r['email'])} - done)
-
-            if not batch:
-                self.log("Nothing left to send: every address in this list has already been emailed with this template.") # 日志
-                self.log("Use 'Reset Progress' to send to the whole list again.") # 日志
-                self.ui(messagebox.showinfo, "All Done", "Every customer in this list has already been emailed.") # 提示框
-                return
-            self.log(f"This batch: {len(batch)} email(s), {remaining_total} remaining in the list, "
-                     f"{delay:g}s between emails.") # 日志
 
             # --- Load HTML content early (if using HTML template) ---
             html_content = None
@@ -732,54 +794,115 @@ class EmailSenderApp:
                 self.log(f"Error: No Excel column for placeholder(s): {', '.join(unknown)}. Found columns: {', '.join(columns)}") # 日志
                 return
 
-            total = len(batch)
-            for pos, r in enumerate(batch, start=1):
+            batch_no = 0
+            total_sent = total_failed = 0
+            while self.is_running:
+                batch, remaining_total = self.next_batch(recipients, excel_file, template_file, batch_size)
+                if not batch:
+                    if batch_no == 0:
+                        self.log("Nothing left to send: every address in this list has already been emailed with this template.") # 日志
+                        self.log("Use 'Reset Progress' to send to the whole list again.") # 日志
+                        self.ui(messagebox.showinfo, "All Done", "Every customer in this list has already been emailed.") # 提示框
+                    break
+                batch_no += 1
+                self.log(f"Batch {batch_no}: {len(batch)} email(s), {remaining_total} remaining in the list.") # 日志
+
+                sent_n, failed_n = self.send_batch(outlook, account, batch, excel_file, template_file,
+                                                   subject_tmpl, html_content, delay_min, delay_max)
+                self.store.set_settings(last_batch_end=datetime.now().isoformat(timespec="seconds"))
+                total_sent += sent_n
+                total_failed += failed_n
+                left = remaining_total - sent_n - failed_n
+                summary = f"Sent: {sent_n}, Failed: {failed_n}. Remaining in list: {left}"
+                self.log(f"Batch {batch_no} finished. {summary}") # 日志
+
                 if not self.is_running:
-                    self.log("Stopped. Progress is saved; the next batch continues from here.") # 日志
+                    break
+                if not auto or left <= 0:
+                    if batch_no > 1:
+                        summary = (f"{batch_no} batches: Sent {total_sent}, Failed {total_failed}. "
+                                   f"Remaining in list: {left}")
+                    if left <= 0:
+                        self.ui(messagebox.showinfo, "All Done", f"Every customer in the list has been emailed!\n{summary}") # 提示框
+                    else:
+                        self.ui(messagebox.showinfo, "Batch Complete", f"Batch finished!\n{summary}") # 提示框
                     break
 
-                email, name, values = r['email'], r['name'], r['values']
-                try:
-                    # Create Mail Item
-                    if html_content is not None:
-                        mail = outlook.CreateItem(0)
-                        mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
-                    else:
-                        mail = outlook.CreateItemFromTemplate(template_file)
-                        if mail.HTMLBody:
-                            mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
+                # Auto mode: wait out the gap, then loop to the next batch
+                self.next_batch_at = datetime.now() + timedelta(minutes=gap_minutes)
+                self.log(f"Waiting {gap_minutes:g} minute(s); next batch starts at {self.next_batch_at:%H:%M}.") # 日志
+                self.wait(gap_minutes * 60)
+                self.next_batch_at = None
 
-                    set_send_account(mail, account)
-                    mail.To = email
-                    mail.Subject = fill_placeholders(subject_tmpl, values)
-                    mail.Send()
-
-                    self.store.mark(excel_file, template_file, email, ok=True)
-                    self.log(f"[{pos}/{total}] Sent to: {name} ({email}) - Excel row {r['row']}") # 日志
-                    success_count += 1
-
-                except Exception as e:
-                    self.store.mark(excel_file, template_file, email, ok=False, error=str(e))
-                    self.log(f"[{pos}/{total}] Failed to send ({email}) - Excel row {r['row']}: {e}") # 日志
-                    failed_count += 1
-
-                self.ui(self.refresh_status)
-                if pos < total:
-                    self.wait(delay)
-
-            left = remaining_total - success_count - failed_count
-            summary = f"Sent: {success_count}, Failed: {failed_count}. Remaining in list: {left}"
-            self.log(f"Batch finished. {summary}") # 日志
-            if self.is_running:
-                self.ui(messagebox.showinfo, "Batch Complete", f"Batch finished!\n{summary}") # 提示框
+            if not self.is_running:
+                self.log("Stopped. Progress is saved; the next batch continues from here.") # 日志
 
         except Exception as e:
             self.log(f"Critical Error: {e}") # 日志
             self.ui(messagebox.showerror, "Error", str(e)) # 提示框
 
         finally:
+            self.next_batch_at = None
             pythoncom.CoUninitialize()
             self.ui(self.reset_ui)
+
+    def next_batch(self, recipients, excel_file, template_file, batch_size):
+        """Valid addresses not already sent/failed, first occurrence only. Returns (batch, remaining_total)"""
+        sent, failed = self.store.campaign(excel_file, template_file)
+        done = set(sent) | set(failed)
+        batch, seen = [], set()
+        for r in recipients:
+            key = r['email'].lower()
+            if not is_valid_email(r['email']) or key in done or key in seen:
+                continue
+            seen.add(key)
+            batch.append(r)
+            if len(batch) >= batch_size:
+                break
+        remaining_total = len({r['email'].lower() for r in recipients if is_valid_email(r['email'])} - done)
+        return batch, remaining_total
+
+    def send_batch(self, outlook, account, batch, excel_file, template_file, subject_tmpl, html_content,
+                   delay_min, delay_max):
+        """Sends one batch with a random wait between emails. Returns (sent, failed)"""
+        success_count = 0
+        failed_count = 0
+        total = len(batch)
+        for pos, r in enumerate(batch, start=1):
+            if not self.is_running:
+                break
+
+            email, name, values = r['email'], r['name'], r['values']
+            try:
+                # Create Mail Item
+                if html_content is not None:
+                    mail = outlook.CreateItem(0)
+                    mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
+                else:
+                    mail = outlook.CreateItemFromTemplate(template_file)
+                    if mail.HTMLBody:
+                        mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
+
+                set_send_account(mail, account)
+                mail.To = email
+                mail.Subject = fill_placeholders(subject_tmpl, values)
+                mail.Send()
+
+                self.store.mark(excel_file, template_file, email, ok=True)
+                self.log(f"[{pos}/{total}] Sent to: {name} ({email}) - Excel row {r['row']}") # 日志
+                success_count += 1
+
+            except Exception as e:
+                self.store.mark(excel_file, template_file, email, ok=False, error=str(e))
+                self.log(f"[{pos}/{total}] Failed to send ({email}) - Excel row {r['row']}: {e}") # 日志
+                failed_count += 1
+
+            self.ui(self.refresh_status)
+            if pos < total and self.is_running:
+                pause = random.uniform(delay_min, delay_max)
+                self.log(f"    waiting {pause:.0f}s...") # 日志
+                self.wait(pause)
+        return success_count, failed_count
 
     def wait(self, seconds):
         """Sleeps in small steps so Stop takes effect right away"""
@@ -802,7 +925,7 @@ class EmailSenderApp:
         settings = self.get_batch_settings()
         self.store.set_settings(excel=self.excel_path.get().strip(), template=self.template_path.get().strip(),
                                 subject=self.subject_template.get(), sender=self.sender.get(),
-                                **({"batch_size": settings[0], "delay_seconds": settings[1]} if settings else {}))
+                                **(self.settings_to_store(settings) if settings else {}))
         self.root.destroy()
 
 

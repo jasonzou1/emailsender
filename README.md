@@ -33,8 +33,14 @@ Use `{{ColumnName}}` for **any** column in your Excel, e.g. `{{FirstName}}`, `{{
 - If the template or subject contains a `{{placeholder}}` with no matching column, **nothing is sent** and the log lists the unknown placeholder(s), so typos never reach customers.
 - In `.oft` templates, type each placeholder in one go: if Outlook formats part of it differently (e.g. bold only `First`), the placeholder gets split and won't be replaced.
 
-4. **Batch settings** – how many emails per batch (default 20) and seconds to wait between emails (default 5).
-5. Click **Send Next 20**. It sends one batch and stops. Click it again whenever you're ready for the next batch. **Stop** halts mid-batch.
+4. **Batch settings**
+   - **Emails per batch** (default 20).
+   - **Random wait between emails**: e.g. `30` to `60` seconds – each email waits a random time in that range, so sending doesn't look robotic. Set both to the same number for a fixed wait.
+   - **Minutes between batches** (default 30).
+   - **Automatically send the next batch after the gap**:
+     - **Off** (default): click **Send Next 20** for each batch. If you click before the gap is over, the app warns you and shows how long is left (you can still send anyway). The time left is also shown under the progress line, and it's remembered even after closing the app.
+     - **On**: click **Start Auto** once; the app sends a batch, waits the gap (with a countdown showing when the next batch starts), sends the next, and so on until the whole list is done. Keep the app and Outlook open. **Stop** works at any time, including during the wait.
+5. Click **Send Next 20** / **Start Auto**. **Stop** halts immediately; progress is saved.
 
 ### Customers tab
 
