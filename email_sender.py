@@ -15,6 +15,17 @@ import random
 from datetime import datetime, timedelta
 
 CO_E_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005
+# Errors meaning Outlook itself went away (closed, restarted, crashed, PC asleep) - not a problem with the customer
+OUTLOOK_CONNECTION_ERRORS = {
+    -2147023174,  # 0x800706BA The RPC server is unavailable
+    -2147023170,  # 0x800706BE The remote procedure call failed
+    -2147417848,  # 0x80010108 The object invoked has disconnected from its clients
+    -2147418111,  # 0x80010001 Call was rejected by callee (Outlook busy)
+    -2147417846,  # 0x8001010A The message filter indicated that the application is busy
+    CO_E_SERVER_EXEC_FAILURE,
+}
+RECONNECT_ATTEMPTS = 4
+RECONNECT_WAIT_SECONDS = 15
 DISPID_SEND_USING_ACCOUNT = 64209
 
 # Accepted header spellings (matched case-insensitively, ignoring spaces/underscores/hyphens)
@@ -58,9 +69,20 @@ def connect_outlook():
         return win32.Dispatch('Outlook.Application')
 
 
+def com_error_code(e):
+    code = getattr(e, 'hresult', None)
+    if code is None and e.args and isinstance(e.args[0], int):
+        code = e.args[0]
+    return code
+
+
+def is_connection_error(e):
+    return com_error_code(e) in OUTLOOK_CONNECTION_ERRORS
+
+
 def explain_outlook_error(e):
     """Extra hint for the common 'Server execution failed' error"""
-    if getattr(e, 'hresult', None) == CO_E_SERVER_EXEC_FAILURE or (e.args and e.args[0] == CO_E_SERVER_EXEC_FAILURE):
+    if com_error_code(e) == CO_E_SERVER_EXEC_FAILURE:
         if is_admin():
             return ("Cause: this program is running as Administrator but Outlook is not. "
                     "Close it and start it normally (not 'Run as administrator').")
@@ -278,6 +300,16 @@ class ProgressStore:
             c["updated"] = now
         self.save()
 
+    def clear_failed(self, excel_file, template_file):
+        """Moves every Failed address back to 'not sent yet'. Returns how many were cleared"""
+        with self.lock:
+            c = self.data["campaigns"].get(self.key(excel_file, template_file))
+            count = len(c["failed"]) if c else 0
+            if c:
+                c["failed"] = {}
+        self.save()
+        return count
+
     def reset(self, excel_file, template_file):
         with self.lock:
             self.data["campaigns"].pop(self.key(excel_file, template_file), None)
@@ -386,6 +418,8 @@ class EmailSenderApp:
         self.btn_start.pack(side=tk.LEFT, padx=5)
         self.btn_reset = tk.Button(frame_btn, text="Reset Progress", command=self.reset_progress) # 按钮
         self.btn_reset.pack(side=tk.LEFT, padx=5)
+        self.btn_retry = tk.Button(frame_btn, text="Retry Failed", command=self.retry_failed) # 按钮
+        self.btn_retry.pack(side=tk.LEFT, padx=5)
 
         # 4. Customers table + Execution Log (tabs)
         notebook = ttk.Notebook(root)
@@ -662,6 +696,22 @@ class EmailSenderApp:
             text += "  (select a template to see progress)"
         self.status_text.set(text)
 
+    def retry_failed(self):
+        excel_file = self.excel_path.get().strip()
+        template_file = self.template_path.get().strip()
+        if self.is_running or not excel_file or not template_file:
+            return
+        _, failed = self.store.campaign(excel_file, template_file)
+        if not failed:
+            messagebox.showinfo("Retry Failed", "There are no failed customers for this list + template.") # 提示框
+            return
+        if messagebox.askyesno("Retry Failed",
+                               f"Move {len(failed)} failed customer(s) back to 'not sent yet'?\n\n"
+                               "They will be included in the next batches."): # 提示框
+            count = self.store.clear_failed(excel_file, template_file)
+            self.log(f"{count} failed customer(s) moved back to 'not sent yet'.") # 日志
+            self.refresh_status()
+
     def reset_progress(self):
         excel_file = self.excel_path.get().strip()
         template_file = self.template_path.get().strip()
@@ -738,6 +788,7 @@ class EmailSenderApp:
         self.is_running = True
         self.btn_start.config(text="Stop", bg="#f44336") # 按钮文本
         self.btn_reset.config(state="disabled")
+        self.btn_retry.config(state="disabled")
         self.btn_check.config(state="disabled")
         thread = threading.Thread(target=self.run_sending_process,
                                   args=(excel_file, template_file, subject_tmpl, batch_size,
@@ -770,24 +821,22 @@ class EmailSenderApp:
                     self.log(f"Error: Could not read HTML template file. {e}") # 日志
                     return
 
+            conn = {}
             try:
-                outlook = connect_outlook()
-                accounts, _ = get_accounts(outlook)
+                self.open_outlook(conn, sender)
+            except LookupError:
+                self.log(f"Error: The account '{sender}' was not found in Outlook. Click 'Check Connection' and pick an account.") # 日志
+                return
             except Exception as e:
                 self.log(f"Error: Could not connect to Outlook. Ensure Classic Outlook is open. ({e})") # 日志
                 hint = explain_outlook_error(e)
                 if hint:
                     self.log(hint) # 日志
                 return
-
-            account = next((a for a in accounts if account_address(a).lower() == sender.lower()), None)
-            if account is None:
-                self.log(f"Error: The account '{sender}' was not found in Outlook. Click 'Check Connection' and pick an account.") # 日志
-                return
             self.log(f"Sending from: {sender}") # 日志
 
             # --- Make sure every {{placeholder}} matches an Excel column before sending anything ---
-            body_text = html_content if html_content is not None else (outlook.CreateItemFromTemplate(template_file).HTMLBody or "")
+            body_text = html_content if html_content is not None else (conn['outlook'].CreateItemFromTemplate(template_file).HTMLBody or "")
             known_keys = {normalize_header(c) for c in columns} | {"name", "firstname"}
             unknown = unknown_placeholders(subject_tmpl + body_text, known_keys)
             if unknown:
@@ -807,14 +856,24 @@ class EmailSenderApp:
                 batch_no += 1
                 self.log(f"Batch {batch_no}: {len(batch)} email(s), {remaining_total} remaining in the list.") # 日志
 
-                sent_n, failed_n = self.send_batch(outlook, account, batch, excel_file, template_file,
-                                                   subject_tmpl, html_content, delay_min, delay_max)
+                sent_n, failed_n, lost = self.send_batch(conn, sender, batch, excel_file, template_file,
+                                                         subject_tmpl, html_content, delay_min, delay_max)
                 self.store.set_settings(last_batch_end=datetime.now().isoformat(timespec="seconds"))
                 total_sent += sent_n
                 total_failed += failed_n
                 left = remaining_total - sent_n - failed_n
                 summary = f"Sent: {sent_n}, Failed: {failed_n}. Remaining in list: {left}"
                 self.log(f"Batch {batch_no} finished. {summary}") # 日志
+
+                if lost:
+                    self.log("Stopped: lost the connection to Outlook and could not reconnect. "
+                             "Customers not reached are still 'not sent yet'.") # 日志
+                    self.ui(messagebox.showerror, "Outlook Disconnected",
+                            "Lost the connection to Outlook (it was closed, restarted or the PC went to sleep) "
+                            "and could not reconnect.\n\n"
+                            "No customers were marked as failed because of this.\n"
+                            "Open Outlook, click 'Check Connection', then continue sending.") # 提示框
+                    break
 
                 if not self.is_running:
                     break
@@ -862,9 +921,51 @@ class EmailSenderApp:
         remaining_total = len({r['email'].lower() for r in recipients if is_valid_email(r['email'])} - done)
         return batch, remaining_total
 
-    def send_batch(self, outlook, account, batch, excel_file, template_file, subject_tmpl, html_content,
+    @staticmethod
+    def open_outlook(conn, sender):
+        """Connects to Outlook and finds the sending account; raises LookupError if the account is missing"""
+        outlook = connect_outlook()
+        accounts, _ = get_accounts(outlook)
+        account = next((a for a in accounts if account_address(a).lower() == sender.lower()), None)
+        if account is None:
+            raise LookupError(sender)
+        conn['outlook'], conn['account'] = outlook, account
+
+    def reconnect(self, conn, sender):
+        """Tries to reconnect after Outlook went away (closed, restarted, crashed). Returns True on success"""
+        for attempt in range(1, RECONNECT_ATTEMPTS + 1):
+            self.wait(RECONNECT_WAIT_SECONDS)
+            if not self.is_running:
+                return False
+            try:
+                self.open_outlook(conn, sender)
+                self.log(f"Reconnected to Outlook (attempt {attempt}).") # 日志
+                return True
+            except Exception as e:
+                self.log(f"Reconnect attempt {attempt}/{RECONNECT_ATTEMPTS} failed: {e}") # 日志
+        return False
+
+    @staticmethod
+    def send_one(conn, r, template_file, subject_tmpl, html_content):
+        outlook, values = conn['outlook'], r['values']
+        # Create Mail Item
+        if html_content is not None:
+            mail = outlook.CreateItem(0)
+            mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
+        else:
+            mail = outlook.CreateItemFromTemplate(template_file)
+            if mail.HTMLBody:
+                mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
+
+        set_send_account(mail, conn['account'])
+        mail.To = r['email']
+        mail.Subject = fill_placeholders(subject_tmpl, values)
+        mail.Send()
+
+    def send_batch(self, conn, sender, batch, excel_file, template_file, subject_tmpl, html_content,
                    delay_min, delay_max):
-        """Sends one batch with a random wait between emails. Returns (sent, failed)"""
+        """Sends one batch with a random wait between emails.
+        Returns (sent, failed, lost_connection). Outlook connection problems never mark a customer as failed."""
         success_count = 0
         failed_count = 0
         total = len(batch)
@@ -872,37 +973,30 @@ class EmailSenderApp:
             if not self.is_running:
                 break
 
-            email, name, values = r['email'], r['name'], r['values']
-            try:
-                # Create Mail Item
-                if html_content is not None:
-                    mail = outlook.CreateItem(0)
-                    mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
-                else:
-                    mail = outlook.CreateItemFromTemplate(template_file)
-                    if mail.HTMLBody:
-                        mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
-
-                set_send_account(mail, account)
-                mail.To = email
-                mail.Subject = fill_placeholders(subject_tmpl, values)
-                mail.Send()
-
-                self.store.mark(excel_file, template_file, email, ok=True)
-                self.log(f"[{pos}/{total}] Sent to: {name} ({email}) - Excel row {r['row']}") # 日志
-                success_count += 1
-
-            except Exception as e:
-                self.store.mark(excel_file, template_file, email, ok=False, error=str(e))
-                self.log(f"[{pos}/{total}] Failed to send ({email}) - Excel row {r['row']}: {e}") # 日志
-                failed_count += 1
+            email, name = r['email'], r['name']
+            for attempt in (1, 2):
+                try:
+                    self.send_one(conn, r, template_file, subject_tmpl, html_content)
+                    self.store.mark(excel_file, template_file, email, ok=True)
+                    self.log(f"[{pos}/{total}] Sent to: {name} ({email}) - Excel row {r['row']}") # 日志
+                    success_count += 1
+                    break
+                except Exception as e:
+                    if not is_connection_error(e):
+                        self.store.mark(excel_file, template_file, email, ok=False, error=str(e))
+                        self.log(f"[{pos}/{total}] Failed to send ({email}) - Excel row {r['row']}: {e}") # 日志
+                        failed_count += 1
+                        break
+                    self.log(f"Lost connection to Outlook while sending to {email}: {e}") # 日志
+                    if attempt == 2 or not self.reconnect(conn, sender):
+                        return success_count, failed_count, self.is_running
 
             self.ui(self.refresh_status)
             if pos < total and self.is_running:
                 pause = random.uniform(delay_min, delay_max)
                 self.log(f"    waiting {pause:.0f}s...") # 日志
                 self.wait(pause)
-        return success_count, failed_count
+        return success_count, failed_count, False
 
     def wait(self, seconds):
         """Sleeps in small steps so Stop takes effect right away"""
@@ -914,6 +1008,7 @@ class EmailSenderApp:
         self.is_running = False
         self.btn_start.config(state="normal", bg="#4CAF50")
         self.btn_reset.config(state="normal")
+        self.btn_retry.config(state="normal")
         self.btn_check.config(state="normal")
         self.update_button_text()
         self.load_customer_list()

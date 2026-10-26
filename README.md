@@ -62,7 +62,8 @@ Use **Show** to filter (All / Not sent yet / Sent / Failed / Skipped) and **Load
 - Progress is kept per **Excel list + template** pair: a new template starts the same list from the top.
 - The app reopens the last Excel/template, subject and batch settings automatically.
 - Progress is tracked by email address, not row number, so you can add, remove or re-sort rows in the Excel safely. Duplicate addresses are only emailed once.
-- Failed addresses are not retried automatically (shown as "Failed" in the progress line, with the reason in the log).
+- Failed addresses are not retried automatically (shown as "Failed" with the reason). Click **Retry Failed** to move them all back to "not sent yet".
+- If Outlook is closed, restarts or the PC sleeps mid-run, the app reconnects automatically (4 tries, 15 s apart) and carries on. If Outlook doesn't come back it stops and tells you; customers it couldn't reach stay "not sent yet" – they are never marked Failed because of an Outlook connection problem.
 - **Reset Progress** forgets what was sent for the current list + template, so the next batch starts from the top again.
 - Keep `email_sender_progress.json` private: it contains customer email addresses.
 
@@ -78,3 +79,7 @@ The sender and Outlook are running with different permission levels. Windows blo
 1. Close the email sender and close Outlook completely (check Task Manager for leftover `OUTLOOK.EXE`).
 2. Open Outlook normally (not "Run as administrator") and wait until it has finished loading.
 3. Start the email sender normally too: don't use "Run as administrator", don't launch it from an admin Command Prompt or an IDE running as admin, and make sure the `.exe`'s Properties → Compatibility → "Run this program as an administrator" is unchecked.
+
+**"The RPC server is unavailable" (-2147023174)**
+
+Outlook went away mid-run (closed, restarted by an Office update, crashed, or the PC went to sleep). The app now reconnects automatically. To keep it from happening: keep Outlook open, and set Windows *Settings → System → Power → Sleep* to "Never" while a long auto run is going.
