@@ -89,3 +89,5 @@ Outlook went away mid-run (closed, restarted by an Office update, crashed, or th
 ## Templates
 
 `templates/holiday-reorder-2026.html` – 2026 holiday re-order email. Starter Excel with the right headers: `templates/holiday-reorder-2026-clients.xlsx`. Excel columns needed: `Email`, `Name` (or `FirstName`), `Order Month`, `Quantity`, `Product`, `List`.
+
+`templates/winback-2026.html` – 2026 win-back email with Early Bird pricing and CASL footer. Excel columns needed: `Email`, `Name` (first name, or "there"), `Sentence` (one full sentence about their last order, e.g. "In December 2024 you sent 187 gift baskets to your team and clients, including the Medium Charcuterie Xmas Gift."). Use a subject without `{{Name}}`, since some rows use "there".
