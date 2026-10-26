@@ -187,10 +187,11 @@ def fill_placeholders(text, values, escape_html=False):
 
 
 def unknown_placeholders(text, known_keys):
-    """Returns {{...}} placeholders in text that don't match any column"""
+    """Returns {{...}} / {...} placeholders in text that don't match any column"""
     found = []
     for match in PLACEHOLDER_RE.finditer(text):
-        if match.group(1) and normalize_header(match.group(1)) not in known_keys and match.group(0) not in found:
+        key = normalize_header(match.group(1) or match.group(2))
+        if key not in known_keys and match.group(0) not in found:
             found.append(match.group(0))
     return found
 

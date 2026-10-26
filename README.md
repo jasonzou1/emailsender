@@ -88,6 +88,12 @@ Outlook went away mid-run (closed, restarted by an Office update, crashed, or th
 
 ## Templates
 
-`templates/holiday-reorder-2026.html` – 2026 holiday re-order email. Starter Excel with the right headers: `templates/holiday-reorder-2026-clients.xlsx`. Excel columns needed: `Email`, `Name` (or `FirstName`), `Order Month`, `Quantity`, `Product`, `List`.
+Both use the same placeholders – Excel columns needed: `First name`, `Email`, `Order month`, `Quantity`, `Product`.
 
-`templates/winback-2026.html` – 2026 win-back email with Early Bird pricing and CASL footer. Excel columns needed: `Email`, `Name` (first name, or "there"), `Sentence` (one full sentence about their last order, e.g. "In December 2024 you sent 187 gift baskets to your team and clients, including the Medium Charcuterie Xmas Gift."). Use a subject without `{{Name}}`, since some rows use "there".
+| Template | For | Order line |
+|---|---|---|
+| `templates/last-year-2025-clients.html` | Clients who ordered last year | "Last {Order month} you sent {Quantity} {Product} to your team and clients." – Order month like `December` |
+| `templates/winback-earlier-clients.html` | Clients from earlier years | "In {Order month} you sent {Quantity} {Product} …" – Order month like `December 2024` |
+
+`Product` must read naturally after the quantity and end with a comma, e.g. `gift baskets, including the Snack Box,` or `gift baskets, the Sweet Box,`. `First name` can be `there` ("Hi there,") – so don't put the name in the subject.
+Any `{Placeholder}` or `{{Placeholder}}` that doesn't match a column stops the send before anything goes out.
