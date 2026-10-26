@@ -88,4 +88,4 @@ Outlook went away mid-run (closed, restarted by an Office update, crashed, or th
 
 ## Templates
 
-`templates/holiday-reorder-2026.html` – 2026 holiday re-order email. Excel columns needed: `Email`, `Name` (or `FirstName`), `Order Month`, `Quantity`, `Product`, `List`.
+`templates/holiday-reorder-2026.html` – 2026 holiday re-order email. Starter Excel with the right headers: `templates/holiday-reorder-2026-clients.xlsx`. Excel columns needed: `Email`, `Name` (or `FirstName`), `Order Month`, `Quantity`, `Product`, `List`.
