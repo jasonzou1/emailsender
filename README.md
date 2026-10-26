@@ -29,7 +29,8 @@ Use `{{ColumnName}}` for **any** column in your Excel, e.g. `{{FirstName}}`, `{{
 - Matching ignores case, spaces, `_` and `-`: `{{company}}`, `{{ Company }}` and `{{Company_Name}}` ↔ column `Company Name` all work.
 - `{{FirstName}}` / `{{name}}` always give the first name (taken from the full name if there's no FirstName column).
 - Single braces (`{FirstName}`, `{Company}`) still work too.
-- An empty cell becomes blank text.
+- If a customer's cell is **empty** for any placeholder the template or subject uses, that customer is **skipped** and shown as **Missing data** (orange) in the Customers tab, naming the empty field – so nobody gets "you sent  to your team". Fill in the cell and click **Load / Refresh List**.
+- Numbers show as typed (`25`, not `25.0`). Excel dates: a date on the 1st shows as a month (`November 2025`), any other date as `December 5, 2025`. For just a month name ("November"), type it as text.
 - If the template or subject contains a `{{placeholder}}` with no matching column, **nothing is sent** and the log lists the unknown placeholder(s), so typos never reach customers.
 - In `.oft` templates, type each placeholder in one go: if Outlook formats part of it differently (e.g. bold only `First`), the placeholder gets split and won't be replaced.
 
@@ -53,6 +54,7 @@ Shows every row of the Excel list with its status:
 | **Next batch** (blue) | Will be sent when you click **Send Next** |
 | **Pending** | Not sent yet, in a later batch |
 | **Invalid email** / **Duplicate** (gray) | Skipped |
+| **Missing data** (orange) | Skipped – a cell used by the template is empty |
 
 Use **Show** to filter (All / Not sent yet / Sent / Failed / Skipped) and **Load / Refresh List** after editing the Excel file. The table updates live while a batch is sending. The full step-by-step log is in the **Execution Log** tab.
 
@@ -83,3 +85,7 @@ The sender and Outlook are running with different permission levels. Windows blo
 **"The RPC server is unavailable" (-2147023174)**
 
 Outlook went away mid-run (closed, restarted by an Office update, crashed, or the PC went to sleep). The app now reconnects automatically. To keep it from happening: keep Outlook open, and set Windows *Settings → System → Power → Sleep* to "Never" while a long auto run is going.
+
+## Templates
+
+`templates/holiday-reorder-2026.html` – 2026 holiday re-order email. Excel columns needed: `Email`, `Name` (or `FirstName`), `Order Month`, `Quantity`, `Product`, `List`.

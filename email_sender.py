@@ -40,14 +40,15 @@ DEFAULT_DELAY_MAX = 60
 DEFAULT_BATCH_GAP_MINUTES = 30
 
 # Customer status labels shown in the table
-ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE = (
-    "Sent", "Failed", "Next batch", "Pending", "Invalid email", "Duplicate")
+ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE, ST_MISSING = (
+    "Sent", "Failed", "Next batch", "Pending", "Invalid email", "Duplicate", "Missing data")
 STATUS_FILTERS = {
     "All": None,
     "Not sent yet": {ST_NEXT, ST_PENDING},
     "Sent": {ST_SENT},
     "Failed": {ST_FAILED},
-    "Skipped": {ST_INVALID, ST_DUPLICATE},
+    "Missing data": {ST_MISSING},
+    "Skipped": {ST_INVALID, ST_DUPLICATE, ST_MISSING},
 }
 
 # Matches {{Column}} (any Excel column) or {Column} (single braces, letters/digits only so CSS is left alone)
@@ -133,9 +134,16 @@ def get_script_dir():
 
 
 def clean_cell(value):
-    """Returns a stripped string, or '' for empty/NaN cells"""
+    """Returns the cell as text the way it looks in Excel, or '' for empty/NaN cells"""
     if pd.isna(value):
         return ""
+    if isinstance(value, datetime):
+        # A date on the 1st is treated as a month ("November 2025"), anything else as a full date
+        if value.day == 1:
+            return value.strftime("%B %Y")
+        return f"{value:%B} {value.day}, {value.year}"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))  # 25.0 -> 25 (pandas turns whole numbers into floats when a column has blanks)
     return str(value).strip()
 
 
@@ -220,10 +228,22 @@ def is_valid_email(email):
     return bool(email) and '@' in email
 
 
-def compute_statuses(recipients, sent, failed, batch_size):
-    """Returns [(recipient, status, detail)] in list order, plus counts per status"""
+def required_placeholders(text, known_keys):
+    """Returns {normalized key: placeholder as written} for every placeholder in text that matches a column"""
+    found = {}
+    for match in PLACEHOLDER_RE.finditer(text):
+        key = normalize_header(match.group(1) or match.group(2))
+        if key in known_keys and key not in found:
+            found[key] = match.group(0)
+    return found
+
+
+def compute_statuses(recipients, sent, failed, batch_size, required=None):
+    """Returns [(recipient, status, detail)] in list order, plus counts per status.
+    required: {key: placeholder} - customers with an empty cell for any of them are skipped as Missing data"""
+    required = required or {}
     rows, seen = [], set()
-    counts = {s: 0 for s in (ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE)}
+    counts = {s: 0 for s in (ST_SENT, ST_FAILED, ST_NEXT, ST_PENDING, ST_INVALID, ST_DUPLICATE, ST_MISSING)}
     next_left = batch_size
     for r in recipients:
         key = r['email'].lower()
@@ -235,6 +255,9 @@ def compute_statuses(recipients, sent, failed, batch_size):
             status, detail = ST_SENT, sent[key] or ""
         elif key in failed:
             status, detail = ST_FAILED, failed[key] or ""
+        elif any(not r['values'].get(k) for k in required):
+            empty = [ph for k, ph in required.items() if not r['values'].get(k)]
+            status, detail = ST_MISSING, "Empty in Excel: " + ", ".join(empty)
         elif next_left > 0:
             status, detail = ST_NEXT, ""
             next_left -= 1
@@ -360,6 +383,8 @@ class EmailSenderApp:
         self.is_running = False
         self.is_checking = False
         self.recipients = []  # cached customer list for the table
+        self.columns = []
+        self.oft_bodies = {}  # .oft template path -> body text, filled in when sending (needs Outlook)
         self.remaining_count = 0
         self._status_job = None
 
@@ -453,6 +478,7 @@ class EmailSenderApp:
         self.table.tag_configure(ST_NEXT, foreground="#1565c0")
         self.table.tag_configure(ST_INVALID, foreground="gray")
         self.table.tag_configure(ST_DUPLICATE, foreground="gray")
+        self.table.tag_configure(ST_MISSING, foreground="#e65100")
 
         tab_log = tk.Frame(notebook)
         notebook.add(tab_log, text="Execution Log") # 标签
@@ -462,6 +488,7 @@ class EmailSenderApp:
         self.auto_load_files()
         self.excel_path.trace_add("write", lambda *_: self.schedule_list_reload())
         self.template_path.trace_add("write", lambda *_: self.schedule_list_reload())
+        self.subject_template.trace_add("write", lambda *_: self.schedule_list_reload())
         self.update_button_text()
         self.load_customer_list()
         if is_admin():
@@ -658,7 +685,7 @@ class EmailSenderApp:
             self.table.delete(*self.table.get_children())
             return
         try:
-            _, self.recipients, _ = load_recipients(excel_file)
+            self.columns, self.recipients, _ = load_recipients(excel_file)
         except Exception as e:
             self.status_text.set("Can't read the customer list - see Execution Log")
             self.log(f"Error reading customer list: {e}") # 日志
@@ -677,7 +704,8 @@ class EmailSenderApp:
         else:
             sent, failed = {}, {}
         settings = self.get_batch_settings()
-        rows, counts = compute_statuses(self.recipients, sent, failed, settings[0] if settings else DEFAULT_BATCH_SIZE)
+        rows, counts = compute_statuses(self.recipients, sent, failed, settings[0] if settings else DEFAULT_BATCH_SIZE,
+                                        self.current_required(template_file))
 
         show = STATUS_FILTERS.get(self.list_filter.get())
         self.table.delete(*self.table.get_children())
@@ -688,13 +716,27 @@ class EmailSenderApp:
         total = counts[ST_SENT] + counts[ST_FAILED] + counts[ST_NEXT] + counts[ST_PENDING]
         remaining = counts[ST_NEXT] + counts[ST_PENDING]
         self.remaining_count = remaining
-        skipped = counts[ST_INVALID] + counts[ST_DUPLICATE]
+        skipped = counts[ST_INVALID] + counts[ST_DUPLICATE] + counts[ST_MISSING]
         text = f"Sent {counts[ST_SENT]} of {total}  |  Failed {counts[ST_FAILED]}  |  Remaining {remaining}"
         if skipped:
             text += f"  |  Skipped {skipped}"
         if not os.path.isfile(template_file):
             text += "  (select a template to see progress)"
         self.status_text.set(text)
+
+    def current_required(self, template_file):
+        """Placeholders used by the subject + template (HTML read directly; .oft known after the first send)"""
+        body = ""
+        if template_file.lower().endswith(('.html', '.htm')):
+            try:
+                with open(template_file, 'r', encoding='utf-8-sig') as f:
+                    body = f.read()
+            except OSError:
+                pass
+        else:
+            body = self.oft_bodies.get(template_file, "")
+        known = {normalize_header(c) for c in self.columns} | {"name", "firstname"}
+        return required_placeholders(self.subject_template.get() + body, known)
 
     def retry_failed(self):
         excel_file = self.excel_path.get().strip()
@@ -842,16 +884,21 @@ class EmailSenderApp:
             if unknown:
                 self.log(f"Error: No Excel column for placeholder(s): {', '.join(unknown)}. Found columns: {', '.join(columns)}") # 日志
                 return
+            required = required_placeholders(subject_tmpl + body_text, known_keys)
+            if html_content is None:
+                self.oft_bodies[template_file] = body_text
 
             batch_no = 0
             total_sent = total_failed = 0
             while self.is_running:
-                batch, remaining_total = self.next_batch(recipients, excel_file, template_file, batch_size)
+                batch, remaining_total = self.next_batch(recipients, excel_file, template_file, batch_size, required)
                 if not batch:
                     if batch_no == 0:
-                        self.log("Nothing left to send: every address in this list has already been emailed with this template.") # 日志
-                        self.log("Use 'Reset Progress' to send to the whole list again.") # 日志
-                        self.ui(messagebox.showinfo, "All Done", "Every customer in this list has already been emailed.") # 提示框
+                        self.log("Nothing left to send: every customer is already Sent, Failed or Skipped (see the Customers tab).") # 日志
+                        self.log("Fill in missing Excel cells, use 'Retry Failed', or 'Reset Progress' to send to the whole list again.") # 日志
+                        self.ui(messagebox.showinfo, "Nothing to Send",
+                                "Every customer in this list is already Sent, Failed or Skipped.\n"
+                                "Check the Customers tab for 'Missing data' or 'Failed' rows.") # 提示框
                     break
                 batch_no += 1
                 self.log(f"Batch {batch_no}: {len(batch)} email(s), {remaining_total} remaining in the list.") # 日志
@@ -905,21 +952,12 @@ class EmailSenderApp:
             pythoncom.CoUninitialize()
             self.ui(self.reset_ui)
 
-    def next_batch(self, recipients, excel_file, template_file, batch_size):
-        """Valid addresses not already sent/failed, first occurrence only. Returns (batch, remaining_total)"""
+    def next_batch(self, recipients, excel_file, template_file, batch_size, required):
+        """The customers marked 'Next batch' in the table. Returns (batch, remaining_total)"""
         sent, failed = self.store.campaign(excel_file, template_file)
-        done = set(sent) | set(failed)
-        batch, seen = [], set()
-        for r in recipients:
-            key = r['email'].lower()
-            if not is_valid_email(r['email']) or key in done or key in seen:
-                continue
-            seen.add(key)
-            batch.append(r)
-            if len(batch) >= batch_size:
-                break
-        remaining_total = len({r['email'].lower() for r in recipients if is_valid_email(r['email'])} - done)
-        return batch, remaining_total
+        rows, counts = compute_statuses(recipients, sent, failed, batch_size, required)
+        batch = [r for r, status, _ in rows if status == ST_NEXT]
+        return batch, counts[ST_NEXT] + counts[ST_PENDING]
 
     @staticmethod
     def open_outlook(conn, sender):
