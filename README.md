@@ -58,6 +58,11 @@ Shows every row of the Excel list with its status:
 
 Use **Show** to filter (All / Not sent yet / Sent / Failed / Skipped) and **Load / Refresh List** after editing the Excel file. The table updates live while a batch is sending. The full step-by-step log is in the **Execution Log** tab.
 
+### Preview and test send
+
+- **Preview Email** (or double-click a customer): shows that customer's email exactly as it will be sent – From, To, Subject and the text – with **< Prev / Next >** to step through customers. Warnings show in red (empty Excel cells, unknown placeholders, invalid email). **Open in Browser** shows the full design (colours, logo, links).
+- **Send Test**: type your own address in **Test send to** and click **Send Test**. It sends the selected customer's personalised email (or the first "Next batch" customer if none is selected) from the chosen account, with **[TEST]** at the start of the subject. Test sends are **not** counted as sent. Also available at the bottom of the preview window.
+
 ### Remembering where you are
 
 - Every address is saved to `email_sender_progress.json` (next to the program) **right after it is sent**, so closing the app, a crash or a restart never loses your place and never re-sends to someone.

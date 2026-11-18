@@ -12,6 +12,9 @@ import sys
 import ctypes
 import json
 import random
+import tempfile
+import webbrowser
+from pathlib import Path
 from datetime import datetime, timedelta
 
 CO_E_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005
@@ -194,6 +197,42 @@ def unknown_placeholders(text, known_keys):
         if key not in known_keys and match.group(0) not in found:
             found.append(match.group(0))
     return found
+
+
+def html_to_text(body):
+    """Readable plain-text version of an HTML email, for the preview window"""
+    t = re.sub(r'(?is)<(head|style|script)\b.*?</\1>', '', body)
+    t = re.sub(r'(?is)<div[^>]*display\s*:\s*none[^>]*>.*?</div>', '', t)  # hidden inbox preview text
+    t = re.sub(r'(?is)<!--.*?-->', '', t)
+    t = re.sub(r'\s+', ' ', t)  # line breaks in the HTML source aren't line breaks in the email
+
+    def link(m):
+        url, text = m.group(1), re.sub(r'<[^>]+>', '', m.group(2)).strip()
+        if not text or text == url or url.startswith(('tel:', 'mailto:')):
+            return text or url
+        return f"{text} [{url}]"
+    t = re.sub(r'(?is)<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>', link, t)
+    t = re.sub(r'(?is)<img\b[^>]*alt="([^"]*)"[^>]*>', r'[image: \1]', t)
+    t = re.sub(r'(?i)<br\s*/?>', '\n', t)
+    t = re.sub(r'(?i)</(p|tr|div|h[1-6]|li|table)>', '\n\n', t)
+    t = html.unescape(re.sub(r'<[^>]+>', '', t)).replace('\xa0', ' ')
+    lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in t.splitlines()]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
+
+
+def compose_mail(outlook, account, values, to, template_file, subject_tmpl, html_content, subject_prefix=""):
+    """Creates (but doesn't send) the Outlook email for one customer"""
+    if html_content is not None:
+        mail = outlook.CreateItem(0)
+        mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
+    else:
+        mail = outlook.CreateItemFromTemplate(template_file)
+        if mail.HTMLBody:
+            mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
+    set_send_account(mail, account)
+    mail.To = to
+    mail.Subject = subject_prefix + fill_placeholders(subject_tmpl, values)
+    return mail
 
 
 def load_recipients(excel_file):
@@ -386,6 +425,12 @@ class EmailSenderApp:
         self.recipients = []  # cached customer list for the table
         self.columns = []
         self.oft_bodies = {}  # .oft template path -> body text, filled in when sending (needs Outlook)
+        self.row_status = {}  # recipient index -> (status, detail), for the preview window
+        self.test_email = tk.StringVar(value=self.store.get_setting("test_email", ""))
+        self.is_testing = False
+        self.preview_win = None
+        self.preview_index = None
+        self.preview_html = None  # (subject, to, html) currently shown in the preview window
         self.remaining_count = 0
         self._status_job = None
 
@@ -460,6 +505,14 @@ class EmailSenderApp:
         filter_box = ttk.Combobox(bar, textvariable=self.list_filter, values=list(STATUS_FILTERS), state="readonly", width=14)
         filter_box.pack(side=tk.LEFT)
         filter_box.bind("<<ComboboxSelected>>", lambda _: self.refresh_status())
+        tk.Button(bar, text="Preview Email", command=self.preview_selected).pack(side=tk.LEFT, padx=(15, 0)) # 按钮
+        bar_test = tk.Frame(tab_customers)
+        bar_test.pack(fill="x", pady=(0, 3))
+        tk.Label(bar_test, text="Test send to:").pack(side=tk.LEFT) # 标签
+        tk.Entry(bar_test, textvariable=self.test_email, width=30).pack(side=tk.LEFT, padx=5)
+        self.btn_test = tk.Button(bar_test, text="Send Test", command=self.send_test) # 按钮
+        self.btn_test.pack(side=tk.LEFT)
+        tk.Label(bar_test, text="(uses the selected customer's details)", fg="gray").pack(side=tk.LEFT, padx=8) # 标签
 
         table_frame = tk.Frame(tab_customers)
         table_frame.pack(fill="both", expand=True)
@@ -480,6 +533,7 @@ class EmailSenderApp:
         self.table.tag_configure(ST_INVALID, foreground="gray")
         self.table.tag_configure(ST_DUPLICATE, foreground="gray")
         self.table.tag_configure(ST_MISSING, foreground="#e65100")
+        self.table.bind("<Double-1>", lambda _: self.preview_selected())
 
         tab_log = tk.Frame(notebook)
         notebook.add(tab_log, text="Execution Log") # 标签
@@ -709,10 +763,18 @@ class EmailSenderApp:
                                         self.current_required(template_file))
 
         show = STATUS_FILTERS.get(self.list_filter.get())
+        selected = self.table.selection()
         self.table.delete(*self.table.get_children())
-        for r, status, detail in rows:
+        self.row_status = {}
+        for i, (r, status, detail) in enumerate(rows):
+            self.row_status[i] = (status, detail)
             if show is None or status in show:
-                self.table.insert("", tk.END, values=(r['row'], r['name'], r['email'], status, detail), tags=(status,))
+                self.table.insert("", tk.END, iid=str(i), values=(r['row'], r['name'], r['email'], status, detail), tags=(status,))
+        keep = [iid for iid in selected if self.table.exists(iid)]
+        if keep:
+            self.table.selection_set(keep)
+        if self.preview_win is not None and self.preview_index is not None:
+            self.show_preview(self.preview_index)
 
         total = counts[ST_SENT] + counts[ST_FAILED] + counts[ST_NEXT] + counts[ST_PENDING]
         remaining = counts[ST_NEXT] + counts[ST_PENDING]
@@ -738,6 +800,249 @@ class EmailSenderApp:
             body = self.oft_bodies.get(template_file, "")
         known = {normalize_header(c) for c in self.columns} | {"name", "firstname"}
         return required_placeholders(self.subject_template.get() + body, known)
+
+    # --- Preview + test send ---
+
+    def selected_index(self, fallback=True):
+        """Index of the selected customer; otherwise the first 'Next batch' customer (or the first row)"""
+        sel = self.table.selection()
+        if sel:
+            return int(sel[0])
+        if not fallback or not self.recipients:
+            return None
+        for i, (status, _) in self.row_status.items():
+            if status == ST_NEXT:
+                return i
+        return 0
+
+    def get_template_body(self, template_file, callback):
+        """Calls callback(html_or_None, error) with the template's HTML. .oft templates are read through Outlook."""
+        if template_file.lower().endswith(('.html', '.htm')):
+            try:
+                with open(template_file, 'r', encoding='utf-8-sig') as f:
+                    callback(f.read(), None)
+            except OSError as e:
+                callback(None, str(e))
+            return
+        if template_file in self.oft_bodies:
+            callback(self.oft_bodies[template_file], None)
+            return
+
+        def worker():
+            pythoncom.CoInitialize()
+            try:
+                body = connect_outlook().CreateItemFromTemplate(template_file).HTMLBody or ""
+                self.oft_bodies[template_file] = body
+                self.ui(callback, body, None)
+            except Exception as e:
+                self.ui(callback, None, f"Could not read the .oft template through Outlook: {e}")
+            finally:
+                pythoncom.CoUninitialize()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def preview_selected(self):
+        template_file = self.template_path.get().strip()
+        if not self.recipients:
+            messagebox.showwarning("Preview", "Load a customer list first.") # 提示框
+            return
+        if not os.path.isfile(template_file):
+            messagebox.showwarning("Preview", "Select an email template first.") # 提示框
+            return
+        self.show_preview(self.selected_index())
+
+    def build_preview_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("Email Preview") # 软件标题
+        win.geometry("760x640")
+        win.protocol("WM_DELETE_WINDOW", self.close_preview)
+        self.preview_win = win
+
+        nav = tk.Frame(win, padx=10, pady=6)
+        nav.pack(fill="x")
+        tk.Button(nav, text="< Prev", command=lambda: self.step_preview(-1)).pack(side=tk.LEFT) # 按钮
+        tk.Button(nav, text="Next >", command=lambda: self.step_preview(1)).pack(side=tk.LEFT, padx=5) # 按钮
+        self.pv_position = tk.Label(nav, font=("Arial", 9, "bold"))
+        self.pv_position.pack(side=tk.LEFT, padx=10)
+        tk.Button(nav, text="Open in Browser", command=self.open_preview_in_browser).pack(side=tk.RIGHT) # 按钮
+
+        head = tk.Frame(win, padx=10)
+        head.pack(fill="x")
+        self.pv_fields = {}
+        for row, label in enumerate(("From", "To", "Subject", "Status")):
+            tk.Label(head, text=label + ":", font=("Arial", 9, "bold"), anchor="e", width=8).grid(row=row, column=0, sticky="e")
+            value = tk.Label(head, anchor="w", justify="left", wraplength=640)
+            value.grid(row=row, column=1, sticky="w", padx=5)
+            self.pv_fields[label] = value
+        self.pv_warning = tk.Label(win, fg="#c62828", anchor="w", justify="left", wraplength=720, padx=10)
+        self.pv_warning.pack(fill="x")
+
+        self.pv_body = scrolledtext.ScrolledText(win, wrap="word", font=("Arial", 10), padx=8, pady=8)
+        self.pv_body.pack(fill="both", expand=True, padx=10, pady=5)
+
+        test = tk.Frame(win, padx=10, pady=6)
+        test.pack(fill="x")
+        tk.Label(test, text="Send a test of THIS email to:").pack(side=tk.LEFT) # 标签
+        tk.Entry(test, textvariable=self.test_email, width=30).pack(side=tk.LEFT, padx=5)
+        self.pv_btn_test = tk.Button(test, text="Send Test", command=lambda: self.send_test(self.preview_index)) # 按钮
+        self.pv_btn_test.pack(side=tk.LEFT)
+
+    def close_preview(self):
+        if self.preview_win is not None:
+            self.preview_win.destroy()
+        self.preview_win = None
+        self.preview_index = None
+
+    def step_preview(self, step):
+        """Moves through the customers in the order the table shows them"""
+        order = [int(iid) for iid in self.table.get_children()] or list(range(len(self.recipients)))
+        if self.preview_index in order:
+            pos = order.index(self.preview_index) + step
+        else:
+            pos = 0
+        index = order[max(0, min(len(order) - 1, pos))]
+        if self.table.exists(str(index)):
+            self.table.selection_set(str(index))
+            self.table.see(str(index))
+        self.show_preview(index)
+
+    def render_email(self, index, body):
+        """Returns (subject, html, warnings) for one customer"""
+        r = self.recipients[index]
+        subject_tmpl = self.subject_template.get()
+        known = {normalize_header(c) for c in self.columns} | {"name", "firstname"}
+        warnings = []
+        unknown = unknown_placeholders(subject_tmpl + body, known)
+        if unknown:
+            warnings.append(f"No Excel column for: {', '.join(unknown)} - sending is blocked until this is fixed.")
+        empty = [ph for k, ph in required_placeholders(subject_tmpl + body, known).items() if not r['values'].get(k)]
+        if empty:
+            warnings.append(f"Empty in Excel for this customer: {', '.join(empty)} - this customer will be skipped.")
+        if not is_valid_email(r['email']):
+            warnings.append("This row has no valid email address - it will be skipped.")
+        return (fill_placeholders(subject_tmpl, r['values']),
+                fill_placeholders(body, r['values'], escape_html=True), warnings)
+
+    def show_preview(self, index):
+        if index is None or index >= len(self.recipients):
+            return
+        if self.preview_win is None:
+            self.build_preview_window()
+        self.preview_index = index
+        self.preview_win.lift()
+        template_file = self.template_path.get().strip()
+        self.pv_body.config(state="normal")
+        self.pv_body.delete("1.0", tk.END)
+        self.pv_body.insert(tk.END, "Loading template...")
+
+        def fill(body, error):
+            if self.preview_win is None or self.preview_index != index:
+                return
+            r = self.recipients[index]
+            status, detail = self.row_status.get(index, ("", ""))
+            visible = [int(iid) for iid in self.table.get_children()]
+            where = f"{visible.index(index) + 1} of {len(visible)}" if index in visible else f"#{index + 1}"
+            self.pv_position.config(text=f"Customer {where}  (Excel row {r['row']})")
+            self.pv_fields["From"].config(text=self.sender.get() or "(no account selected - click Check Connection)")
+            self.pv_fields["To"].config(text=r['email'] or "(empty)")
+            self.pv_fields["Status"].config(text=status + (f" - {detail}" if detail else ""))
+            self.pv_body.config(state="normal")
+            self.pv_body.delete("1.0", tk.END)
+            if error:
+                self.pv_fields["Subject"].config(text="")
+                self.pv_warning.config(text=error)
+                self.preview_html = None
+            else:
+                subject, filled, warnings = self.render_email(index, body)
+                self.pv_fields["Subject"].config(text=subject)
+                self.pv_warning.config(text="\n".join(warnings))
+                self.pv_body.insert(tk.END, html_to_text(filled))
+                self.preview_html = (subject, r['email'], filled)
+            self.pv_body.config(state="disabled")
+        self.get_template_body(template_file, fill)
+
+    def open_preview_in_browser(self):
+        """Shows the exact HTML in the default browser, with From/To/Subject on top"""
+        if not self.preview_html:
+            return
+        subject, to, filled = self.preview_html
+        banner = ('<div style="font-family:Arial,sans-serif;font-size:13px;background:#f3f3f3;border-bottom:1px solid #ccc;'
+                  'padding:10px 16px;line-height:1.6;"><b>PREVIEW</b> &middot; From: ' + html.escape(self.sender.get()) +
+                  ' &middot; To: ' + html.escape(to) + '<br><b>Subject:</b> ' + html.escape(subject) + '</div>')
+        page = re.sub(r'(?i)(<body[^>]*>)', lambda m: m.group(1) + banner, filled, count=1)
+        if page == filled:
+            page = banner + filled
+        path = os.path.join(tempfile.gettempdir(), "mybaskets_email_preview.html")
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(page)
+        webbrowser.open(Path(path).as_uri())
+
+    def send_test(self, index=None):
+        """Sends one customer's personalised email to the test address. Not recorded as sent."""
+        to = self.test_email.get().strip()
+        template_file = self.template_path.get().strip()
+        sender = self.sender.get().strip()
+        if self.is_running or self.is_testing:
+            messagebox.showwarning("Send Test", "Please wait until the current sending has finished.") # 提示框
+            return
+        if not is_valid_email(to):
+            messagebox.showwarning("Send Test", "Type the email address to send the test to.") # 提示框
+            return
+        if not self.recipients or not os.path.isfile(template_file):
+            messagebox.showwarning("Send Test", "Select a customer list and a template first.") # 提示框
+            return
+        if not sender:
+            messagebox.showwarning("Send Test", "No sending account selected. Click 'Check Connection' first.") # 提示框
+            return
+        if index is None:
+            index = self.selected_index()
+        r = self.recipients[index]
+        self.store.set_settings(test_email=to)
+
+        def go(body, error):
+            if error:
+                messagebox.showerror("Send Test", error) # 提示框
+                return
+            subject, _, warnings = self.render_email(index, body)
+            if any("sending is blocked" in w for w in warnings):
+                messagebox.showerror("Send Test", "\n".join(warnings)) # 提示框
+                return
+            question = (f"Send a test of the email for {r['name'] or '(no name)'} <{r['email']}> (Excel row {r['row']})\n\n"
+                        f"From: {sender}\nTo: {to}\nSubject: [TEST] {subject}")
+            if warnings:
+                question += "\n\nWarning:\n" + "\n".join(warnings)
+            if not messagebox.askyesno("Send Test", question + "\n\nSend it?"): # 提示框
+                return
+            self.set_testing(True)
+            html_content = body if template_file.lower().endswith(('.html', '.htm')) else None
+            threading.Thread(target=self._send_test_worker, daemon=True,
+                             args=(r, to, sender, template_file, self.subject_template.get(), html_content)).start()
+        self.get_template_body(template_file, go)
+
+    def _send_test_worker(self, r, to, sender, template_file, subject_tmpl, html_content):
+        pythoncom.CoInitialize()
+        try:
+            conn = {}
+            self.open_outlook(conn, sender)
+            compose_mail(conn['outlook'], conn['account'], r['values'], to, template_file, subject_tmpl,
+                         html_content, subject_prefix="[TEST] ").Send()
+            self.log(f"Test email sent to {to} (personalised for {r['email']}, Excel row {r['row']}).") # 日志
+            self.ui(messagebox.showinfo, "Send Test", f"Test email sent to {to}.\n\nIt is not counted as sent for the customer.") # 提示框
+        except LookupError:
+            self.ui(messagebox.showerror, "Send Test", f"The account '{sender}' was not found in Outlook. Click 'Check Connection'.") # 提示框
+        except Exception as e:
+            self.log(f"Test email failed: {e}") # 日志
+            hint = explain_outlook_error(e)
+            self.ui(messagebox.showerror, "Send Test", f"Test email failed: {e}" + (f"\n\n{hint}" if hint else "")) # 提示框
+        finally:
+            pythoncom.CoUninitialize()
+            self.ui(self.set_testing, False)
+
+    def set_testing(self, testing):
+        self.is_testing = testing
+        state = "disabled" if testing else "normal"
+        self.btn_test.config(state=state, text="Sending..." if testing else "Send Test") # 按钮文本
+        if self.preview_win is not None:
+            self.pv_btn_test.config(state=state, text="Sending..." if testing else "Send Test") # 按钮文本
 
     def retry_failed(self):
         excel_file = self.excel_path.get().strip()
@@ -788,8 +1093,8 @@ class EmailSenderApp:
             if not os.path.isfile(path):
                 messagebox.showwarning("Warning", f"File not found:\n{path}") # 提示框
                 return
-        if self.is_checking:
-            messagebox.showwarning("Warning", "Still checking the Outlook connection, please wait a moment.") # 提示框
+        if self.is_checking or self.is_testing:
+            messagebox.showwarning("Warning", "Still checking the Outlook connection or sending a test, please wait a moment.") # 提示框
             return
         sender = self.sender.get().strip()
         if not sender:
@@ -986,20 +1291,8 @@ class EmailSenderApp:
 
     @staticmethod
     def send_one(conn, r, template_file, subject_tmpl, html_content):
-        outlook, values = conn['outlook'], r['values']
-        # Create Mail Item
-        if html_content is not None:
-            mail = outlook.CreateItem(0)
-            mail.HTMLBody = fill_placeholders(html_content, values, escape_html=True)
-        else:
-            mail = outlook.CreateItemFromTemplate(template_file)
-            if mail.HTMLBody:
-                mail.HTMLBody = fill_placeholders(mail.HTMLBody, values, escape_html=True)
-
-        set_send_account(mail, conn['account'])
-        mail.To = r['email']
-        mail.Subject = fill_placeholders(subject_tmpl, values)
-        mail.Send()
+        compose_mail(conn['outlook'], conn['account'], r['values'], r['email'],
+                     template_file, subject_tmpl, html_content).Send()
 
     def send_batch(self, conn, sender, batch, excel_file, template_file, subject_tmpl, html_content,
                    delay_min, delay_max):
@@ -1059,6 +1352,7 @@ class EmailSenderApp:
         settings = self.get_batch_settings()
         self.store.set_settings(excel=self.excel_path.get().strip(), template=self.template_path.get().strip(),
                                 subject=self.subject_template.get(), sender=self.sender.get(),
+                                test_email=self.test_email.get().strip(),
                                 **(self.settings_to_store(settings) if settings else {}))
         self.root.destroy()
 
